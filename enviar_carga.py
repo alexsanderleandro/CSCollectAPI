@@ -77,8 +77,12 @@ def obter_config_validada() -> dict:
     url = config.get("url", "").strip()
     autorizacao = config.get("autorizacao", "").strip()
     pasta = config.get("pasta_cargas", "").strip()
+    cnpj = config.get("cnpj", "").strip()
+    codvendedor = config.get("codvendedor", "").strip()
+    idcelular = config.get("idcelular", "").strip()
 
-    if not url or not autorizacao or not pasta or not os.path.isdir(pasta):
+    if not url or not autorizacao or not pasta or not os.path.isdir(pasta) \
+            or not cnpj or not codvendedor or not idcelular:
         print("Configurações incompletas ou inválidas. Abrindo janela de configurações...")
         abrir_configuracoes()
         print("Configurações salvas. Execute o script novamente.")
@@ -136,7 +140,7 @@ def salvar_ultimo_enviado(nome):
         f.write(nome)
 
 
-def enviar_arquivo(caminho: str, url: str, autorizacao: str) -> None:
+def enviar_arquivo(caminho: str, url: str, autorizacao: str, cnpj: str, codvendedor: str, idcelular: str) -> None:
     """
     Envia um arquivo .zip para o endpoint de upload da API.
 
@@ -148,6 +152,9 @@ def enviar_arquivo(caminho: str, url: str, autorizacao: str) -> None:
         caminho (str): Caminho completo do arquivo a ser enviado.
         url (str): URL base da API.
         autorizacao (str): Token de autorização para o header.
+        cnpj (str): CNPJ da empresa logada.
+        codvendedor (str): Código do vendedor (3 dígitos).
+        idcelular (str): Identificador do celular destino.
     """
     nome = os.path.basename(caminho)
 
@@ -157,7 +164,12 @@ def enviar_arquivo(caminho: str, url: str, autorizacao: str) -> None:
 
     with open(caminho, "rb") as f:
         files = {"file": (nome, f)}
-        resp = requests.post(f"{url}/upload", files=files, headers=headers)
+        data = {
+            "cnpj": cnpj,
+            "codvendedor": codvendedor,
+            "idcelular": idcelular
+        }
+        resp = requests.post(f"{url}/upload", files=files, data=data, headers=headers)
 
     print(resp.json())
     salvar_ultimo_enviado(nome)
@@ -176,6 +188,9 @@ if __name__ == "__main__":
     pasta = config["pasta_cargas"]
     url = config["url"]
     autorizacao = config["autorizacao"]
+    cnpj = config["cnpj"]
+    codvendedor = config["codvendedor"]
+    idcelular = config["idcelular"]
 
     arquivo = pegar_ultimo_arquivo(pasta)
 
@@ -190,4 +205,4 @@ if __name__ == "__main__":
         print("Arquivo já enviado:", nome)
     else:
         print("Enviando:", nome)
-        enviar_arquivo(arquivo, url, autorizacao)
+        enviar_arquivo(arquivo, url, autorizacao, cnpj, codvendedor, idcelular)

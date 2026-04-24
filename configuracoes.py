@@ -3,10 +3,16 @@ configuracoes.py
 
 Janela de configurações da aplicação CSCollect.
 
-Permite ao usuário definir e alterar:
+Permite ao usuário definir e alterar os campos ESTÁTICOS:
 - URL da API
 - Header de autorização (token)
 - Caminho da pasta de cargas
+
+Os campos DINÂMICOS abaixo são gravados pelo manager a cada geração de carga
+e não aparecem nesta janela:
+- cnpj       → CNPJ da empresa logada
+- codvendedor → Código do vendedor selecionado (3 dígitos)
+- idcelular   → ID do celular destino selecionado
 
 As configurações são persistidas automaticamente no arquivo config.json.
 
@@ -37,9 +43,14 @@ from PySide6.QtGui import QIcon
 ARQUIVO_CONFIG = "config.json"
 
 DEFAULTS = {
+    # campos estáticos — configurados pelo usuário nesta janela
     "url": "https://cscollectapi.onrender.com",
     "autorizacao": "abc123",
     "pasta_cargas": "",
+    # campos dinâmicos — gravados pelo manager a cada geração de carga
+    "cnpj": "",
+    "codvendedor": "",
+    "idcelular": "",
 }
 
 
@@ -199,6 +210,7 @@ class JanelaConfiguracoes(QWidget):
         self.config["url"] = url
         self.config["autorizacao"] = autorizacao
         self.config["pasta_cargas"] = pasta
+        # campos dinâmicos (cnpj, codvendedor, idcelular) são preservados como estão
         salvar_config(self.config)
 
         QMessageBox.information(self, "Sucesso", "Configurações salvas com sucesso.")
