@@ -15,11 +15,68 @@ Uso:
 import os
 import sys
 import json
+import glob
 import argparse
 import requests
+from datetime import date
 
 ARQUIVO_CONTROLE = "ultimo_enviado.txt"
 ARQUIVO_CONFIG = "config.json"
+
+
+NOME_KEY = "Licenca_CSCollectManager_LOCAL_ELETRONICA.key"
+
+
+def localizar_key() -> str | None:
+    """
+    Localiza o arquivo .key na pasta do script ou nas pastas pai (até 3 níveis).
+
+    Returns:
+        str | None: Caminho completo do .key encontrado, ou None.
+    """
+    base = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(4):
+        candidato = os.path.join(base, NOME_KEY)
+        if os.path.isfile(candidato):
+            return candidato
+        base = os.path.dirname(base)
+    return None
+
+
+def carregar_key() -> dict:
+    """
+    Lê e retorna o conteúdo do arquivo .key.
+
+    Returns:
+        dict: Dados da licença (cnpjs, ids, token, validade, database_url).
+
+    Raises:
+        SystemExit: Se o arquivo não for encontrado ou estiver corrompido.
+    """
+    caminho = localizar_key()
+    if not caminho:
+        print(f"[ERRO] Arquivo de licença '{NOME_KEY}' não encontrado.")
+        sys.exit(1)
+
+    try:
+        with open(caminho, "r", encoding="utf-8") as f:
+            dados = json.load(f)
+    except Exception as e:
+        print(f"[ERRO] Falha ao ler o arquivo de licença: {e}")
+        sys.exit(1)
+
+    # Valida a data de expiração
+    validade_str = dados.get("validade", "")
+    try:
+        validade = date.fromisoformat(validade_str)
+        if date.today() > validade:
+            print(f"[ERRO] Licença expirada em {validade_str}. Renove sua licença.")
+            sys.exit(1)
+    except ValueError:
+        print(f"[ERRO] Data de validade inválida no arquivo de licença: '{validade_str}'")
+        sys.exit(1)
+
+    return dados
 
 
 def carregar_config():
@@ -73,21 +130,31 @@ def obter_config_validada() -> dict:
     Returns:
         dict: Dicionário com url, autorizacao e pasta_cargas válidos.
     """
+    # Valida e carrega a licença (.key) antes de qualquer coisa
+    key = carregar_key()
+
     config = carregar_config()
     url = config.get("url", "").strip()
-    autorizacao = config.get("autorizacao", "").strip()
     pasta = config.get("pasta_cargas", "").strip()
     cnpj = config.get("cnpj", "").strip()
     codvendedor = config.get("codvendedor", "").strip()
     idcelular = config.get("idcelular", "").strip()
 
-    if not url or not autorizacao or not pasta or not os.path.isdir(pasta) \
+    if not url or not pasta or not os.path.isdir(pasta) \
             or not cnpj or not codvendedor or not idcelular:
         print("Configurações incompletas ou inválidas. Abrindo janela de configurações...")
         abrir_configuracoes()
         print("Configurações salvas. Execute o script novamente.")
         sys.exit(0)
 
+    # Valida o CNPJ configurado contra os CNPJs autorizados na licença
+    cnpjs_autorizados = key.get("cnpjs", [])
+    if cnpjs_autorizados and cnpj not in cnpjs_autorizados:
+        print(f"[ERRO] CNPJ '{cnpj}' não autorizado nesta licença.")
+        sys.exit(1)
+
+    # Injeta o token da licença nas configurações (substitui autorizacao manual)
+    config["autorizacao"] = key["token"]
     return config
 
 
@@ -184,7 +251,7 @@ if __name__ == "__main__":
         abrir_configuracoes()
         sys.exit(0)
 
-    config = obter_config_validada()
+    config = obter_config_validada()  # token do .key já injetado em config["autorizacao"]
     pasta = config["pasta_cargas"]
     url = config["url"]
     autorizacao = config["autorizacao"]
