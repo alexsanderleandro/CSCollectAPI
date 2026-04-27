@@ -72,17 +72,25 @@ async def upload(
 
     db = Session()
     try:
+        # Busca cliente_id pela tabela clientes
+        row = db.execute(
+            text("SELECT id FROM clientes WHERE cnpj = :cnpj"),
+            {"cnpj": cnpj}
+        ).fetchone()
+        cliente_id = row[0] if row else None
+
         db.execute(
             text("""
-                INSERT INTO cargas (cnpj, nome_arquivo, url_arquivo, idcelular, codvendedor)
-                VALUES (:cnpj, :nome, :url, :idcelular, :codvendedor)
+                INSERT INTO cargas (cnpj, nome_arquivo, url_arquivo, idcelular, codvendedor, cliente_id)
+                VALUES (:cnpj, :nome, :url, :idcelular, :codvendedor, :cliente_id)
             """),
             {
                 "cnpj": cnpj,
                 "nome": file.filename,
                 "url": url_arquivo,
                 "idcelular": idcelular,
-                "codvendedor": codvendedor
+                "codvendedor": codvendedor,
+                "cliente_id": cliente_id
             }
         )
         db.commit()
