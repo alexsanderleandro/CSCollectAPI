@@ -2,7 +2,12 @@ from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
+import hashlib
+import hmac
+import io
+import json
 import os
+import zipfile
 
 # ==============================
 # CONFIG BANCO (NEON)
@@ -27,6 +32,99 @@ BASE_DIR = "cargas"
 os.makedirs(BASE_DIR, exist_ok=True)
 
 # ==============================
+# VALIDAÇÃO DE ASSINATURA .SIG
+# ==============================
+
+def validar_sig_bytes(zip_bytes: bytes, token_cliente: str) -> dict:
+    """
+    Valida o arquivo .sig contido no ZIP exportado pelo CSCollect.
+    Retorna dict com:
+        ok      : bool  — True se assinatura e hashes são válidos
+        erros   : list  — lista de mensagens de erro encontradas
+        payload : dict  — payload do .sig (mesmo se inválido)
+    """
+    erros = []
+    payload = {}
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as zf:
+            names = zf.namelist()
+
+            # 1. Localizar o .sig
+            sig_names = [n for n in names if n.endswith('.sig')]
+            if not sig_names:
+                return {'ok': False, 'erros': ['Arquivo .sig não encontrado no ZIP'], 'payload': {}}
+
+            sig_content = zf.read(sig_names[0]).decode('utf-8')
+            doc = json.loads(sig_content)
+            payload    = doc.get('payload', {})
+            assinatura = doc.get('assinatura', '')
+
+            # 2. JSON canônico do payload
+            payload_json  = json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                                       separators=(',', ':'))
+            payload_bytes = payload_json.encode('utf-8')
+
+            # 3. Validar HMAC (pula se serial vazio — modo offline)
+            serial = payload.get('serial', '')
+            if serial:
+                chave = (token_cliente or '').encode('utf-8')
+                expected_sig = hmac.new(chave, payload_bytes, hashlib.sha256).hexdigest()
+                if not hmac.compare_digest(expected_sig, assinatura):
+                    erros.append('Assinatura HMAC inválida — token não confere ou payload adulterado')
+            # se serial vazio, omite validação HMAC e verifica apenas integridade
+
+            # 4. Helper SHA-256 de entrada do ZIP
+            def _sha256_entry(name):
+                h = hashlib.sha256()
+                with zf.open(name) as f:
+                    for chunk in iter(lambda: f.read(65536), b''):
+                        h.update(chunk)
+                return h.hexdigest()
+
+            # TXT
+            txt_names = [n for n in names if n.endswith('.txt')]
+            if txt_names:
+                h = _sha256_entry(txt_names[0])
+                if h != payload.get('hash_txt', ''):
+                    erros.append(f'Hash TXT diverge: esperado={payload.get("hash_txt")} calculado={h}')
+            else:
+                erros.append('Arquivo TXT não encontrado no ZIP')
+
+            # PDF (opcional)
+            pdf_names = [n for n in names if n.endswith('.pdf')]
+            if pdf_names and payload.get('hash_pdf'):
+                h = _sha256_entry(pdf_names[0])
+                if h != payload['hash_pdf']:
+                    erros.append(f'Hash PDF diverge: esperado={payload["hash_pdf"]} calculado={h}')
+
+            # Fotos
+            for arcname, expected_hash in (payload.get('hash_fotos') or {}).items():
+                if arcname in names:
+                    h = _sha256_entry(arcname)
+                    if h != expected_hash:
+                        erros.append(f'Hash foto diverge [{arcname}]: esperado={expected_hash} calculado={h}')
+                else:
+                    erros.append(f'Foto declarada no .sig não encontrada no ZIP: {arcname}')
+
+    except zipfile.BadZipFile:
+        return {'ok': False, 'erros': ['Arquivo ZIP corrompido ou inválido'], 'payload': {}}
+    except Exception as e:
+        return {'ok': False, 'erros': [f'Erro ao validar .sig: {e}'], 'payload': payload}
+
+    return {'ok': len(erros) == 0, 'erros': erros, 'payload': payload}
+
+
+def _buscar_token_cliente(db, cnpj: str) -> str:
+    """Retorna o token da licença do cliente pelo CNPJ, ou string vazia se não encontrado."""
+    row = db.execute(
+        text("SELECT token FROM clientes WHERE cnpj = :cnpj"),
+        {"cnpj": cnpj}
+    ).fetchone()
+    return row[0] if row else ''
+
+
+# ==============================
 # AUTH
 # ==============================
 
@@ -43,6 +141,12 @@ def verificar_token(authorization: str):
 @app.get("/")
 def inicio():
     return {"status": "API funcionando"}
+
+@app.get("/health")
+def health():
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+    return {"status": "ok"}
 
 # ------------------------------
 # Upload de carga (enviado pelo manager)
@@ -262,12 +366,30 @@ async def upload_contagem(
 ):
     verificar_token(authorization)
 
+    conteudo = await file.read()
+
+    # Validar assinatura .sig antes de aceitar o arquivo
+    db_val = Session()
+    try:
+        token = _buscar_token_cliente(db_val, cnpj)
+    finally:
+        db_val.close()
+
+    resultado_sig = validar_sig_bytes(conteudo, token)
+    if not resultado_sig['ok']:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "erro": "Validação de assinatura falhou",
+                "detalhes": resultado_sig['erros']
+            }
+        )
+
     pasta = os.path.join("contagens", cnpj, idcelular)
     os.makedirs(pasta, exist_ok=True)
 
     caminho = os.path.join(pasta, file.filename)
 
-    conteudo = await file.read()
     with open(caminho, "wb") as f:
         f.write(conteudo)
 
@@ -345,6 +467,26 @@ def download_contagem(cnpj: str, idcelular: str, nome: str, authorization: str =
 
     if not os.path.exists(caminho):
         raise HTTPException(status_code=404, detail="Arquivo não encontrado")
+
+    # Re-validar assinatura .sig antes de servir o arquivo
+    with open(caminho, "rb") as f:
+        conteudo = f.read()
+
+    db_val = Session()
+    try:
+        token = _buscar_token_cliente(db_val, cnpj)
+    finally:
+        db_val.close()
+
+    resultado_sig = validar_sig_bytes(conteudo, token)
+    if not resultado_sig['ok']:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "erro": "Arquivo com assinatura inválida — download bloqueado",
+                "detalhes": resultado_sig['erros']
+            }
+        )
 
     return FileResponse(caminho)
 
