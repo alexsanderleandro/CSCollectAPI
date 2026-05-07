@@ -58,8 +58,8 @@ async def upload(
 ):
     verificar_token(authorization)
 
-    # pasta organizada por cnpj/idcelular
-    pasta = os.path.join(BASE_DIR, cnpj, idcelular)
+    # pasta organizada por cnpj/codvendedor
+    pasta = os.path.join(BASE_DIR, cnpj, codvendedor)
     os.makedirs(pasta, exist_ok=True)
 
     caminho = os.path.join(pasta, file.filename)
@@ -68,7 +68,7 @@ async def upload(
     with open(caminho, "wb") as f:
         f.write(conteudo)
 
-    url_arquivo = f"/download/{cnpj}/{idcelular}/{file.filename}"
+    url_arquivo = f"/download/{cnpj}/{codvendedor}/{file.filename}"
 
     db = Session()
     try:
@@ -113,21 +113,32 @@ async def upload(
 def ultima(
     cnpj: str,
     idcelular: str,
+    codvendedor: str,
     authorization: str = Header(...)
 ):
     verificar_token(authorization)
 
+    # idcelular pode vir com vírgulas: "cel1,cel2,cel3"
+    ids = [i.strip() for i in idcelular.split(",") if i.strip()]
+
     db = Session()
     try:
+        placeholders = ", ".join(f":id{i}" for i in range(len(ids)))
+        params: dict = {"cnpj": cnpj, "codvendedor": codvendedor}
+        for i, v in enumerate(ids):
+            params[f"id{i}"] = v
+
         carga = db.execute(
-            text("""
+            text(f"""
                 SELECT id, nome_arquivo, url_arquivo, data_envio, codvendedor
                 FROM cargas
-                WHERE cnpj = :cnpj AND idcelular = :idcelular
+                WHERE cnpj = :cnpj
+                  AND codvendedor = :codvendedor
+                  AND idcelular IN ({placeholders})
                 ORDER BY data_envio DESC
                 LIMIT 1
             """),
-            {"cnpj": cnpj, "idcelular": idcelular}
+            params
         ).fetchone()
     finally:
         db.close()
@@ -144,27 +155,46 @@ def ultima(
     }
 
 # ------------------------------
-# Download
+# Download — deleta registro do Neon antes de servir
 # ------------------------------
-@app.get("/download/{cnpj}/{idcelular}/{nome}")
-def download(cnpj: str, idcelular: str, nome: str, authorization: str = Header(...)):
+@app.get("/download/{cnpj}/{codvendedor}/{nome}")
+def download(cnpj: str, codvendedor: str, nome: str, authorization: str = Header(...)):
     verificar_token(authorization)
 
-    caminho = os.path.join(BASE_DIR, cnpj, idcelular, nome)
+    caminho = os.path.join(BASE_DIR, cnpj, codvendedor, nome)
 
     if not os.path.exists(caminho):
         raise HTTPException(status_code=404, detail="Arquivo não encontrado")
 
+    # Remove o registro do banco antes de servir o arquivo
+    db = Session()
+    try:
+        db.execute(
+            text(
+                "DELETE FROM cargas "
+                "WHERE cnpj = :cnpj AND codvendedor = :codvendedor AND nome_arquivo = :nome"
+            ),
+            {"cnpj": cnpj, "codvendedor": codvendedor, "nome": nome}
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    # Serve o arquivo local
+    # Alternativa: com open() para controle total do stream
+    # with open(caminho, "rb") as f:
+    #     conteudo = f.read()
+    # return Response(content=conteudo, media_type="application/octet-stream")
     return FileResponse(caminho)
 
 # ------------------------------
 # Deletar carga após download confirmado
 # ------------------------------
-@app.delete("/download/{cnpj}/{idcelular}/{nome}")
-def deletar_carga(cnpj: str, idcelular: str, nome: str, authorization: str = Header(...)):
+@app.delete("/download/{cnpj}/{codvendedor}/{nome}")
+def deletar_carga(cnpj: str, codvendedor: str, nome: str, authorization: str = Header(...)):
     verificar_token(authorization)
 
-    caminho = os.path.abspath(os.path.join(BASE_DIR, cnpj, idcelular, nome))
+    caminho = os.path.abspath(os.path.join(BASE_DIR, cnpj, codvendedor, nome))
     base_abs = os.path.abspath(BASE_DIR)
 
     if not caminho.startswith(base_abs + os.sep):
@@ -178,8 +208,11 @@ def deletar_carga(cnpj: str, idcelular: str, nome: str, authorization: str = Hea
     db = Session()
     try:
         db.execute(
-            text("DELETE FROM cargas WHERE cnpj = :cnpj AND idcelular = :idcelular AND nome_arquivo = :nome"),
-            {"cnpj": cnpj, "idcelular": idcelular, "nome": nome}
+            text(
+                "DELETE FROM cargas "
+                "WHERE cnpj = :cnpj AND codvendedor = :codvendedor AND nome_arquivo = :nome"
+            ),
+            {"cnpj": cnpj, "codvendedor": codvendedor, "nome": nome}
         )
         db.commit()
     finally:
