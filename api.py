@@ -8,6 +8,7 @@ import io
 import json
 import os
 import zipfile
+from datetime import datetime, timezone
 
 # ==============================
 # CONFIG BANCO (NEON)
@@ -183,10 +184,12 @@ async def upload(
         ).fetchone()
         cliente_id = row[0] if row else None
 
+        data_envio = datetime.now(timezone.utc)
+
         db.execute(
             text("""
-                INSERT INTO cargas (cnpj, nome_arquivo, url_arquivo, idcelular, codvendedor, cliente_id)
-                VALUES (:cnpj, :nome, :url, :idcelular, :codvendedor, :cliente_id)
+                INSERT INTO cargas (cnpj, nome_arquivo, url_arquivo, idcelular, codvendedor, cliente_id, data_envio)
+                VALUES (:cnpj, :nome, :url, :idcelular, :codvendedor, :cliente_id, :data_envio)
             """),
             {
                 "cnpj": cnpj,
@@ -194,7 +197,8 @@ async def upload(
                 "url": url_arquivo,
                 "idcelular": idcelular,
                 "codvendedor": codvendedor,
-                "cliente_id": cliente_id
+                "cliente_id": cliente_id,
+                "data_envio": data_envio
             }
         )
         db.commit()
@@ -397,16 +401,19 @@ async def upload_contagem(
 
     db = Session()
     try:
+        data_envio = datetime.now(timezone.utc)
+
         db.execute(
             text("""
-                INSERT INTO contagens (cnpj, idcelular, nome_arquivo, url_arquivo)
-                VALUES (:cnpj, :idcelular, :nome, :url)
+                INSERT INTO contagens (cnpj, idcelular, nome_arquivo, url_arquivo, data_envio)
+                VALUES (:cnpj, :idcelular, :nome, :url, :data_envio)
             """),
             {
                 "cnpj": cnpj,
                 "idcelular": idcelular,
                 "nome": file.filename,
-                "url": url_arquivo
+                "url": url_arquivo,
+                "data_envio": data_envio
             }
         )
         db.commit()
