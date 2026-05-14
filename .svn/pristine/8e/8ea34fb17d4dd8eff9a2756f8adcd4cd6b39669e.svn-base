@@ -1,16 +1,14 @@
-from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
-import asyncio
 import hashlib
 import hmac
 import io
 import json
 import os
 import zipfile
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 # ==============================
 # CONFIG BANCO (NEON)
@@ -28,108 +26,7 @@ Session = sessionmaker(bind=engine)
 # APP
 # ==============================
 
-# ==============================
-# LIMPEZA AUTOMÁTICA (3 HORAS)
-# ==============================
-
-EXPIRACAO_HORAS = 3
-INTERVALO_LIMPEZA_SEGUNDOS = 5 * 60  # verifica a cada 5 minutos
-
-
-def _limpar_expirados():
-    """
-    Remove do banco (Neon) e do disco (Render) todos os registros de cargas
-    e contagens cujo data_envio seja anterior a (agora - EXPIRACAO_HORAS).
-    Executado em background pela tarefa assíncrona.
-    """
-    limite = datetime.now(timezone.utc) - timedelta(hours=EXPIRACAO_HORAS)
-
-    db = Session()
-    try:
-        # ---- Cargas expiradas ----
-        cargas = db.execute(
-            text("""
-                SELECT cnpj, codvendedor, nome_arquivo
-                FROM cargas
-                WHERE data_envio < :limite
-            """),
-            {"limite": limite}
-        ).fetchall()
-
-        for row in cargas:
-            cnpj, codvendedor, nome = row[0], row[1], row[2]
-            caminho = os.path.join(BASE_DIR, cnpj, codvendedor, nome)
-            if os.path.isfile(caminho):
-                try:
-                    os.remove(caminho)
-                except Exception as e:
-                    print(f"[LIMPEZA] Erro ao remover arquivo de carga '{caminho}': {e}")
-
-        if cargas:
-            db.execute(
-                text("DELETE FROM cargas WHERE data_envio < :limite"),
-                {"limite": limite}
-            )
-            print(f"[LIMPEZA] {len(cargas)} carga(s) expirada(s) removida(s).")
-
-        # ---- Contagens expiradas ----
-        contagens = db.execute(
-            text("""
-                SELECT cnpj, idcelular, nome_arquivo
-                FROM contagens
-                WHERE data_envio < :limite
-            """),
-            {"limite": limite}
-        ).fetchall()
-
-        for row in contagens:
-            cnpj, idcelular, nome = row[0], row[1], row[2]
-            caminho = os.path.join("contagens", cnpj, idcelular, nome)
-            if os.path.isfile(caminho):
-                try:
-                    os.remove(caminho)
-                except Exception as e:
-                    print(f"[LIMPEZA] Erro ao remover arquivo de contagem '{caminho}': {e}")
-
-        if contagens:
-            db.execute(
-                text("DELETE FROM contagens WHERE data_envio < :limite"),
-                {"limite": limite}
-            )
-            print(f"[LIMPEZA] {len(contagens)} contagem(s) expirada(s) removida(s).")
-
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        print(f"[LIMPEZA] Erro durante limpeza: {e}")
-    finally:
-        db.close()
-
-
-async def _tarefa_limpeza():
-    """Loop assíncrono que executa a limpeza periódica de registros expirados."""
-    while True:
-        await asyncio.sleep(INTERVALO_LIMPEZA_SEGUNDOS)
-        try:
-            _limpar_expirados()
-        except Exception as e:
-            print(f"[LIMPEZA] Exceção não tratada na tarefa de limpeza: {e}")
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Inicia a tarefa de limpeza no startup e a cancela no shutdown."""
-    tarefa = asyncio.create_task(_tarefa_limpeza())
-    print(f"[LIMPEZA] Tarefa de limpeza iniciada (expiração: {EXPIRACAO_HORAS}h, intervalo: {INTERVALO_LIMPEZA_SEGUNDOS}s).")
-    yield
-    tarefa.cancel()
-    try:
-        await tarefa
-    except asyncio.CancelledError:
-        pass
-
-
-app = FastAPI(lifespan=lifespan)
+app = FastAPI()
 
 # garante pasta local
 BASE_DIR = "cargas"
