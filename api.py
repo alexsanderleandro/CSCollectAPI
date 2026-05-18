@@ -638,3 +638,93 @@ def teste_db(authorization: str = Header(...)):
         db.close()
 
     return {"cargas": [dict(r._mapping) for r in result]}
+
+# ------------------------------
+# Validacao de licenca mobile
+# Recebe cnpj + device_id, consulta tabela clientes,
+# retorna dados para o cliente validar localmente.
+# ------------------------------
+from pydantic import BaseModel
+
+class ValidarLicencaRequest(BaseModel):
+    cnpj: str
+    device_id: str
+
+@app.post("/validar-licenca")
+def validar_licenca(req: ValidarLicencaRequest):
+    cnpj = (req.cnpj or '').strip()
+    device_id = (req.device_id or '').strip()
+
+    if not cnpj or not device_id:
+        return {'ok': False, 'motivo': 'parametros_invalidos', 'mensagem': 'cnpj e device_id sao obrigatorios'}
+
+    db = Session()
+    try:
+        row = db.execute(
+            text("""
+                SELECT cnpj, idcelular, token, validade, ativo, nome_cliente,
+                       sql_servidor, sql_banco, api_authorization, api_database_url
+                FROM clientes
+                WHERE cnpj = :cnpj
+                   OR cnpj LIKE :like1
+                   OR cnpj LIKE :like2
+                   OR cnpj LIKE :like3
+                LIMIT 1
+            """),
+            {
+                'cnpj': cnpj,
+                'like1': f'%,{cnpj}',
+                'like2': f'{cnpj},%',
+                'like3': f'%,{cnpj},%',
+            }
+        ).fetchone()
+    finally:
+        db.close()
+
+    if not row:
+        return {'ok': False, 'motivo': 'licenca_nao_encontrada_no_servidor', 'mensagem': 'CNPJ nao cadastrado'}
+
+    (
+        db_cnpj, db_idcelular_raw, db_token, db_validade,
+        db_ativo, db_nome, db_sql_servidor, db_sql_banco,
+        db_api_auth, db_api_db_url
+    ) = row
+
+    if not db_ativo:
+        return {'ok': False, 'motivo': 'licenca_desativada_no_servidor', 'mensagem': 'Licenca desativada'}
+
+    if db_validade:
+        try:
+            from datetime import date as _date
+            exp = datetime.strptime(str(db_validade)[:10], '%Y-%m-%d').date()
+            if _date.today() > exp:
+                return {'ok': False, 'motivo': 'licenca_expirada_no_servidor', 'mensagem': 'Licenca expirada'}
+        except Exception:
+            pass
+
+    ids_no_banco = [x.strip() for x in str(db_idcelular_raw or '').split(',') if x.strip()]
+    if device_id not in ids_no_banco:
+        return {
+            'ok': False,
+            'motivo': 'licenca_nao_encontrada_no_servidor',
+            'mensagem': f'device_id nao autorizado ({len(ids_no_banco)} IDs cadastrados)'
+        }
+
+    validade_str = str(db_validade)[:10] if db_validade else ''
+    cnpjs = [x.strip() for x in str(db_cnpj or '').split(',') if x.strip()]
+    ids   = [x.strip() for x in str(db_idcelular_raw or '').split(',') if x.strip()]
+
+    return {
+        'ok': True,
+        'motivo': '',
+        'mensagem': 'Licenca valida',
+        'validade': validade_str,
+        'nome_cliente': str(db_nome) if db_nome else '',
+        'cnpjs': cnpjs,
+        'ids': ids,
+        'sql_servidor': str(db_sql_servidor) if db_sql_servidor else '',
+        'sql_banco': str(db_sql_banco) if db_sql_banco else '',
+        'token': str(db_token) if db_token else '',
+        'api_authorization': str(db_api_auth) if db_api_auth else '',
+        'api_database_url': str(db_api_db_url) if db_api_db_url else '',
+    }
