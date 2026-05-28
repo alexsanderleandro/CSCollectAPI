@@ -1,6 +1,6 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 import asyncio
@@ -234,8 +234,21 @@ def _buscar_token_cliente(db, cnpj: str) -> str:
 
 API_TOKEN = os.getenv("API_TOKEN", "")
 
+def _normalizar_token(raw: str) -> str:
+    """Remove prefixo 'Bearer ' (case-insensitive) para normalizar comparação.
+
+    O CSCollect envia 'Bearer <token>' enquanto o CSCollectManager envia
+    apenas '<token>'. A comparação é feita sempre sobre o valor puro.
+    """
+    s = (raw or "").strip()
+    if s.lower().startswith("bearer "):
+        s = s[7:].strip()
+    return s
+
 def verificar_token(authorization: str):
-    if not API_TOKEN or authorization != API_TOKEN:
+    token_recebido = _normalizar_token(authorization)
+    token_esperado = _normalizar_token(API_TOKEN)
+    if not token_esperado or token_recebido != token_esperado:
         raise HTTPException(status_code=401, detail="Token inválido")
 
 # ==============================
@@ -650,6 +663,82 @@ class ValidarLicencaRequest(BaseModel):
     cnpj: str
     device_id: str
 
+
+def _buscar_registro_licenca(db, cnpj: str):
+    return db.execute(
+        text("""
+            SELECT cnpj, idcelular, token, arq_licenca, validade, ativo, nome_cliente,
+                   sql_servidor, sql_banco, api_authorization, api_database_url
+            FROM clientes
+            WHERE cnpj = :cnpj
+               OR cnpj LIKE :like1
+               OR cnpj LIKE :like2
+               OR cnpj LIKE :like3
+            LIMIT 1
+        """),
+        {
+            'cnpj': cnpj,
+            'like1': f'%,{cnpj}',
+            'like2': f'{cnpj},%',
+            'like3': f'%,{cnpj},%',
+        }
+    ).fetchone()
+
+
+def _validar_e_montar_licenca(row, cnpj: str, device_id: str):
+    if not row:
+        return {'ok': False, 'motivo': 'licenca_nao_encontrada_no_servidor', 'mensagem': 'CNPJ nao cadastrado'}
+
+    (
+        db_cnpj, db_idcelular_raw, db_token, db_arq_licenca, db_validade,
+        db_ativo, db_nome, db_sql_servidor, db_sql_banco,
+        db_api_auth, db_api_db_url
+    ) = row
+
+    if not db_ativo:
+        return {'ok': False, 'motivo': 'licenca_desativada_no_servidor', 'mensagem': 'Licenca desativada'}
+    if db_validade:
+        try:
+            from datetime import date as _date
+            exp = datetime.strptime(str(db_validade)[:10], '%Y-%m-%d').date()
+            if _date.today() > exp:
+                return {'ok': False, 'motivo': 'licenca_expirada_no_servidor', 'mensagem': 'Licenca expirada'}
+        except Exception:
+            pass
+
+    ids_no_banco = [x.strip() for x in str(db_idcelular_raw or '').split(',') if x.strip()]
+    if device_id not in ids_no_banco:
+        return {
+            'ok': False,
+            'motivo': 'licenca_nao_encontrada_no_servidor',
+            'mensagem': f'device_id nao autorizado ({len(ids_no_banco)} IDs cadastrados)'
+        }
+
+    validade_str = str(db_validade)[:10] if db_validade else ''
+    cnpjs = [x.strip() for x in str(db_cnpj or '').split(',') if x.strip()]
+    ids = [x.strip() for x in str(db_idcelular_raw or '').split(',') if x.strip()]
+    return {
+        'ok': True,
+        'motivo': '',
+        'mensagem': 'Licenca valida',
+        'validade': validade_str,
+        'nome_cliente': str(db_nome) if db_nome else '',
+        'cnpjs': cnpjs,
+        'ids': ids,
+        'sql_servidor': str(db_sql_servidor) if db_sql_servidor else '',
+        'sql_banco': str(db_sql_banco) if db_sql_banco else '',
+        'token': str(db_token) if db_token else '',
+        'arq_licenca': str(db_arq_licenca) if db_arq_licenca else '',
+        'api_authorization': str(db_api_auth) if db_api_auth else '',
+        'api_database_url': str(db_api_db_url) if db_api_db_url else '',
+    }
+
+
+def _nome_arquivo_licenca(nome_cliente: str, cnpj: str) -> str:
+    base = nome_cliente or cnpj or 'cliente'
+    safe = ''.join(ch for ch in str(base) if ch.isalnum() or ch in (' ', '_', '-')).strip().replace(' ', '_')
+    return f"Licenca_CSCollectManager_{safe or 'cliente'}.key"
+
 @app.post("/validar-licenca")
 def validar_licenca(req: ValidarLicencaRequest):
     cnpj = (req.cnpj or '').strip()
@@ -681,50 +770,37 @@ def validar_licenca(req: ValidarLicencaRequest):
     finally:
         db.close()
 
-    if not row:
-        return {'ok': False, 'motivo': 'licenca_nao_encontrada_no_servidor', 'mensagem': 'CNPJ nao cadastrado'}
+    payload = _validar_e_montar_licenca(row, cnpj, device_id)
+    if payload.get('ok'):
+        payload['download_url'] = f'/download-licenca?cnpj={cnpj}&device_id={device_id}'
+    return payload
 
-    (
-        db_cnpj, db_idcelular_raw, db_token, db_validade,
-        db_ativo, db_nome, db_sql_servidor, db_sql_banco,
-        db_api_auth, db_api_db_url
-    ) = row
 
-    if not db_ativo:
-        return {'ok': False, 'motivo': 'licenca_desativada_no_servidor', 'mensagem': 'Licenca desativada'}
+@app.get("/download-licenca")
+def download_licenca(cnpj: str, device_id: str):
+    cnpj = (cnpj or '').strip()
+    device_id = (device_id or '').strip()
 
-    if db_validade:
-        try:
-            from datetime import date as _date
-            exp = datetime.strptime(str(db_validade)[:10], '%Y-%m-%d').date()
-            if _date.today() > exp:
-                return {'ok': False, 'motivo': 'licenca_expirada_no_servidor', 'mensagem': 'Licenca expirada'}
-        except Exception:
-            pass
+    if not cnpj or not device_id:
+        raise HTTPException(status_code=400, detail='cnpj e device_id sao obrigatorios')
 
-    ids_no_banco = [x.strip() for x in str(db_idcelular_raw or '').split(',') if x.strip()]
-    if device_id not in ids_no_banco:
-        return {
-            'ok': False,
-            'motivo': 'licenca_nao_encontrada_no_servidor',
-            'mensagem': f'device_id nao autorizado ({len(ids_no_banco)} IDs cadastrados)'
-        }
+    db = Session()
+    try:
+        row = _buscar_registro_licenca(db, cnpj)
+    finally:
+        db.close()
 
-    validade_str = str(db_validade)[:10] if db_validade else ''
-    cnpjs = [x.strip() for x in str(db_cnpj or '').split(',') if x.strip()]
-    ids   = [x.strip() for x in str(db_idcelular_raw or '').split(',') if x.strip()]
+    payload = _validar_e_montar_licenca(row, cnpj, device_id)
+    if not payload.get('ok'):
+        raise HTTPException(status_code=404, detail=payload.get('mensagem', 'Licenca nao encontrada'))
 
-    return {
-        'ok': True,
-        'motivo': '',
-        'mensagem': 'Licenca valida',
-        'validade': validade_str,
-        'nome_cliente': str(db_nome) if db_nome else '',
-        'cnpjs': cnpjs,
-        'ids': ids,
-        'sql_servidor': str(db_sql_servidor) if db_sql_servidor else '',
-        'sql_banco': str(db_sql_banco) if db_sql_banco else '',
-        'token': str(db_token) if db_token else '',
-        'api_authorization': str(db_api_auth) if db_api_auth else '',
-        'api_database_url': str(db_api_db_url) if db_api_db_url else '',
-    }
+    conteudo = payload.get('arq_licenca') or payload.get('token')
+    if not conteudo:
+        raise HTTPException(status_code=404, detail='Licenca encontrada, mas sem arquivo disponivel')
+
+    nome_arquivo = _nome_arquivo_licenca(payload.get('nome_cliente', ''), cnpj)
+    return Response(
+        content=str(conteudo).encode('cp1252', errors='replace'),
+        media_type='application/octet-stream',
+        headers={'Content-Disposition': f'attachment; filename="{nome_arquivo}"'}
+    )
