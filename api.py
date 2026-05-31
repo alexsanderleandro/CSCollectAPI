@@ -851,7 +851,7 @@ def ativar_online(req: AtivarOnlineRequest, request: Request):
     try:
         row_tok = db.execute(
             text("""
-                SELECT id, cnpj, expira_em, usado_em
+                SELECT id, cnpj, expira_em, usado_em, device_id_autorizado
                 FROM activation_tokens
                 WHERE token_hash = :hash
                 LIMIT 1
@@ -862,7 +862,7 @@ def ativar_online(req: AtivarOnlineRequest, request: Request):
         if not row_tok:
             return {'ok': False, 'motivo': 'token_invalido', 'mensagem': 'Token de ativacao nao encontrado'}
 
-        tok_id, tok_cnpj, tok_expira, tok_usado = row_tok
+        tok_id, tok_cnpj, tok_expira, tok_usado, tok_dev_autorizado = row_tok
 
         if tok_usado is not None:
             return {'ok': False, 'motivo': 'token_ja_utilizado', 'mensagem': 'Token ja foi utilizado'}
@@ -877,7 +877,28 @@ def ativar_online(req: AtivarOnlineRequest, request: Request):
         if cnpj not in tok_cnpjs and tok_cnpj != cnpj:
             return {'ok': False, 'motivo': 'token_cnpj_mismatch', 'mensagem': 'Token nao pertence ao CNPJ informado'}
 
-        # Buscar registro de licença
+        # Verificar device_id: deve bater com o autorizado pelo operador
+        if tok_dev_autorizado and tok_dev_autorizado.strip() != device_id:
+            return {
+                'ok': False,
+                'motivo': 'device_id_nao_autorizado',
+                'mensagem': 'Este token foi gerado para outro dispositivo'
+            }
+
+        # Registrar device_id em clientes.idcelular (se ainda não estiver)
+        row_lic = _buscar_registro_licenca(db, cnpj)
+        if row_lic:
+            ids_atuais = [x.strip() for x in str(row_lic[1] or '').split(',') if x.strip()]
+            if device_id not in ids_atuais:
+                ids_atuais.append(device_id)
+                novo_ids = ','.join(ids_atuais)
+                db.execute(
+                    text("UPDATE clientes SET idcelular = :ids WHERE cnpj = :cnpj"),
+                    {'ids': novo_ids, 'cnpj': row_lic[0]}
+                )
+                print(f'[ativar-online] device_id {device_id} registrado em clientes cnpj={cnpj}')
+
+        # Buscar registro atualizado e montar payload
         row_lic = _buscar_registro_licenca(db, cnpj)
         payload = _validar_e_montar_licenca(row_lic, cnpj, device_id)
 
