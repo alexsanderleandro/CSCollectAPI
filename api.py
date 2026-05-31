@@ -1,8 +1,11 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 import asyncio
 import hashlib
 import hmac
@@ -11,6 +14,13 @@ import json
 import os
 import zipfile
 from datetime import datetime, timedelta, timezone
+
+# Carrega .env local se existir (útil para desenvolvimento)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 # ==============================
 # CONFIG BANCO (NEON)
@@ -130,6 +140,11 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+# R3: Rate limiting — 10 tentativas por minuto por IP nos endpoints públicos
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # garante pasta local
 BASE_DIR = "cargas"
@@ -740,7 +755,8 @@ def _nome_arquivo_licenca(nome_cliente: str, cnpj: str) -> str:
     return f"Licenca_CSCollectManager_{safe or 'cliente'}.key"
 
 @app.post("/validar-licenca")
-def validar_licenca(req: ValidarLicencaRequest):
+@limiter.limit("10/minute")
+def validar_licenca(req: ValidarLicencaRequest, request: Request):
     cnpj = (req.cnpj or '').strip()
     device_id = (req.device_id or '').strip()
 
@@ -800,7 +816,88 @@ def download_licenca(cnpj: str, device_id: str):
 
     nome_arquivo = _nome_arquivo_licenca(payload.get('nome_cliente', ''), cnpj)
     return Response(
-        content=str(conteudo).encode('cp1252', errors='replace'),
+        content=str(conteudo).encode('utf-8'),
         media_type='application/octet-stream',
         headers={'Content-Disposition': f'attachment; filename="{nome_arquivo}"'}
     )
+
+
+# ------------------------------
+# Ativação Online — sem arquivo .key
+# O operador gera um token avulso no CSCollectLicence e envia ao usuário.
+# O app troca esse token (uso único, TTL curto) pela licença completa.
+# ------------------------------
+
+class AtivarOnlineRequest(BaseModel):
+    cnpj: str
+    device_id: str
+    activation_token: str   # raw token recebido do operador (43 chars URL-safe)
+
+
+@app.post("/ativar-online")
+@limiter.limit("5/minute")
+def ativar_online(req: AtivarOnlineRequest, request: Request):
+    cnpj       = (req.cnpj or '').strip()
+    device_id  = (req.device_id or '').strip()
+    raw_token  = (req.activation_token or '').strip()
+
+    if not cnpj or not device_id or not raw_token:
+        return {'ok': False, 'motivo': 'parametros_invalidos', 'mensagem': 'cnpj, device_id e activation_token sao obrigatorios'}
+
+    import hashlib as _hl
+    token_hash = _hl.sha256(raw_token.encode('utf-8')).hexdigest()
+
+    db = Session()
+    try:
+        row_tok = db.execute(
+            text("""
+                SELECT id, cnpj, expira_em, usado_em
+                FROM activation_tokens
+                WHERE token_hash = :hash
+                LIMIT 1
+            """),
+            {'hash': token_hash}
+        ).fetchone()
+
+        if not row_tok:
+            return {'ok': False, 'motivo': 'token_invalido', 'mensagem': 'Token de ativacao nao encontrado'}
+
+        tok_id, tok_cnpj, tok_expira, tok_usado = row_tok
+
+        if tok_usado is not None:
+            return {'ok': False, 'motivo': 'token_ja_utilizado', 'mensagem': 'Token ja foi utilizado'}
+
+        from datetime import timezone as _tz
+        now_utc = datetime.now(_tz.utc)
+        if tok_expira and tok_expira < now_utc:
+            return {'ok': False, 'motivo': 'token_expirado', 'mensagem': 'Token expirado'}
+
+        # Verificar que o token pertence ao cnpj solicitado
+        tok_cnpjs = [x.strip() for x in str(tok_cnpj or '').split(',') if x.strip()]
+        if cnpj not in tok_cnpjs and tok_cnpj != cnpj:
+            return {'ok': False, 'motivo': 'token_cnpj_mismatch', 'mensagem': 'Token nao pertence ao CNPJ informado'}
+
+        # Buscar registro de licença
+        row_lic = _buscar_registro_licenca(db, cnpj)
+        payload = _validar_e_montar_licenca(row_lic, cnpj, device_id)
+
+        if payload.get('ok'):
+            # Marcar token como usado
+            db.execute(
+                text("""
+                    UPDATE activation_tokens
+                    SET usado_em = :now, device_id_usado = :dev
+                    WHERE id = :id
+                """),
+                {'now': now_utc, 'dev': device_id, 'id': tok_id}
+            )
+            db.commit()
+            payload['download_url'] = f'/download-licenca?cnpj={cnpj}&device_id={device_id}'
+
+        return payload
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f'Erro interno: {e}')
+    finally:
+        db.close()
