@@ -651,6 +651,74 @@ def deletar_contagem(cnpj: str, idcelular: str, nome: str, authorization: str = 
         raise HTTPException(status_code=500, detail=f"Erro ao remover arquivo: {e}")
 
 # ------------------------------
+# Listar contagens por CNPJ (usado pelo CSCollectManager como fallback HTTP)
+# ------------------------------
+@app.get("/contagens")
+def listar_contagens(cnpj: str, authorization: str = Header(...)):
+    verificar_token(authorization)
+
+    db = Session()
+    try:
+        rows = db.execute(
+            text("""
+                SELECT id, cnpj, idcelular, nome_arquivo, url_arquivo, data_envio
+                  FROM contagens
+                 WHERE cnpj = :cnpj
+                 ORDER BY data_envio DESC
+            """),
+            {"cnpj": cnpj}
+        ).fetchall()
+    finally:
+        db.close()
+
+    return [
+        {
+            "id": r[0],
+            "cnpj": r[1],
+            "idcelular": r[2],
+            "nome_arquivo": r[3],
+            "url_arquivo": r[4],
+            "data_envio": str(r[5]) if r[5] else None,
+        }
+        for r in rows
+    ]
+
+
+# ------------------------------
+# Deletar contagem por ID (usado pelo CSCollectManager como fallback HTTP)
+# ------------------------------
+@app.delete("/contagem/{contagem_id}")
+def deletar_contagem_por_id(contagem_id: int, authorization: str = Header(...)):
+    verificar_token(authorization)
+
+    db = Session()
+    try:
+        row = db.execute(
+            text("SELECT cnpj, idcelular, nome_arquivo FROM contagens WHERE id = :id"),
+            {"id": contagem_id}
+        ).fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Contagem não encontrada.")
+
+        cnpj, idcelular, nome = row[0], row[1], row[2]
+        caminho = os.path.join("contagens", cnpj, idcelular, nome)
+
+        if os.path.isfile(caminho):
+            try:
+                os.remove(caminho)
+            except Exception:
+                pass
+
+        db.execute(text("DELETE FROM contagens WHERE id = :id"), {"id": contagem_id})
+        db.commit()
+    finally:
+        db.close()
+
+    return JSONResponse(status_code=200, content={"ok": True, "mensagem": f"Contagem {contagem_id} removida com sucesso."})
+
+
+# ------------------------------
 # TESTE BANCO
 # ------------------------------
 @app.get("/teste-db")
