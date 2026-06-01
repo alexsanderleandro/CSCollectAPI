@@ -842,13 +842,13 @@ def _validar_e_montar_licenca(row, cnpj: str, device_id: str):
     validade_str = str(db_validade)[:10] if db_validade else ''
     cnpjs = [x.strip() for x in str(db_cnpj or '').split(',') if x.strip()]
     ids = [x.strip() for x in str(db_idcelular_raw or '').split(',') if x.strip()]
-    # Fallbacks para fluxo "ativação online sem .key":
-    # - Se api_authorization não estiver preenchido no banco, usar API_TOKEN do ambiente.
-    # - Se api_database_url não estiver preenchido, usar DATABASE_URL do ambiente.
-    api_auth_out = str(db_api_auth).strip() if db_api_auth else ''
-    if not api_auth_out:
-        api_auth_out = _normalizar_token(API_TOKEN)
-
+    # IMPORTANTE: Para o APK (mobile), sempre retornar API_TOKEN como api_authorization.
+    # O banco pode ter um valor criptografado (para CSCollectManager), mas o APK recebe
+    # plaintext porque usa um secret compartilhado com a API.
+    # O valor do banco (db_api_auth) é criptografado com MASTER_KEY — o APK não pode descriptografar.
+    api_auth_out = _normalizar_token(API_TOKEN)
+    
+    # api_database_url: usar do banco (criptografado lá) ou fallback para DATABASE_URL
     api_db_out = str(db_api_db_url).strip() if db_api_db_url else ''
     if not api_db_out:
         api_db_out = str(DATABASE_URL or '').strip()
