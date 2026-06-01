@@ -748,10 +748,39 @@ class ValidarLicencaRequest(BaseModel):
 
 
 def _buscar_registro_licenca(db, cnpj: str):
-    return db.execute(
+    params = {
+        'cnpj': cnpj,
+        'like1': f'%,{cnpj}',
+        'like2': f'{cnpj},%',
+        'like3': f'%,{cnpj},%',
+    }
+
+    # Esquema atual (v6+): inclui arq_licenca e campos de API criptografados.
+    try:
+        row = db.execute(
+            text("""
+                SELECT cnpj, idcelular, token, arq_licenca, validade, ativo, nome_cliente,
+                       sql_servidor, sql_banco, api_authorization, api_database_url
+                FROM clientes
+                WHERE cnpj = :cnpj
+                   OR cnpj LIKE :like1
+                   OR cnpj LIKE :like2
+                   OR cnpj LIKE :like3
+                LIMIT 1
+            """),
+            params
+        ).fetchone()
+        if row is not None:
+            return row
+    except Exception as e:
+        # Produção pode estar com schema legado (sem colunas novas). Tenta fallback.
+        print(f"[licenca] query v6 falhou, tentando fallback legado: {e}")
+
+    # Esquema legado: não possui arq_licenca/api_authorization/api_database_url.
+    row_legacy = db.execute(
         text("""
-            SELECT cnpj, idcelular, token, arq_licenca, validade, ativo, nome_cliente,
-                   sql_servidor, sql_banco, api_authorization, api_database_url
+            SELECT cnpj, idcelular, token, validade, ativo, nome_cliente,
+                   sql_servidor, sql_banco
             FROM clientes
             WHERE cnpj = :cnpj
                OR cnpj LIKE :like1
@@ -759,13 +788,26 @@ def _buscar_registro_licenca(db, cnpj: str):
                OR cnpj LIKE :like3
             LIMIT 1
         """),
-        {
-            'cnpj': cnpj,
-            'like1': f'%,{cnpj}',
-            'like2': f'{cnpj},%',
-            'like3': f'%,{cnpj},%',
-        }
+        params
     ).fetchone()
+
+    if not row_legacy:
+        return None
+
+    # Normaliza para o formato esperado por _validar_e_montar_licenca (11 campos).
+    return (
+        row_legacy[0],  # cnpj
+        row_legacy[1],  # idcelular
+        row_legacy[2],  # token
+        '',             # arq_licenca (indisponível no legado)
+        row_legacy[3],  # validade
+        row_legacy[4],  # ativo
+        row_legacy[5],  # nome_cliente
+        row_legacy[6],  # sql_servidor
+        row_legacy[7],  # sql_banco
+        '',             # api_authorization (indisponível no legado)
+        '',             # api_database_url (indisponível no legado)
+    )
 
 
 def _validar_e_montar_licenca(row, cnpj: str, device_id: str):
@@ -833,31 +875,21 @@ def validar_licenca(req: ValidarLicencaRequest, request: Request):
 
     db = Session()
     try:
-        row = db.execute(
-            text("""
-                SELECT cnpj, idcelular, token, validade, ativo, nome_cliente,
-                       sql_servidor, sql_banco, api_authorization, api_database_url
-                FROM clientes
-                WHERE cnpj = :cnpj
-                   OR cnpj LIKE :like1
-                   OR cnpj LIKE :like2
-                   OR cnpj LIKE :like3
-                LIMIT 1
-            """),
-            {
-                'cnpj': cnpj,
-                'like1': f'%,{cnpj}',
-                'like2': f'{cnpj},%',
-                'like3': f'%,{cnpj},%',
-            }
-        ).fetchone()
+        row = _buscar_registro_licenca(db, cnpj)
+        payload = _validar_e_montar_licenca(row, cnpj, device_id)
+        if payload.get('ok'):
+            payload['download_url'] = f'/download-licenca?cnpj={cnpj}&device_id={device_id}'
+        return payload
+    except Exception as e:
+        # Evita HTTP 500 sem corpo JSON (quebra o cliente mobile no parse).
+        print(f"[licenca] validar_licenca erro interno: {e}")
+        return {
+            'ok': False,
+            'motivo': 'erro_servidor_licenca',
+            'mensagem': 'Falha interna ao validar licença. Tente novamente em instantes.'
+        }
     finally:
         db.close()
-
-    payload = _validar_e_montar_licenca(row, cnpj, device_id)
-    if payload.get('ok'):
-        payload['download_url'] = f'/download-licenca?cnpj={cnpj}&device_id={device_id}'
-    return payload
 
 
 @app.get("/download-licenca")
