@@ -6,12 +6,12 @@
 
 CREATE TABLE IF NOT EXISTS activation_tokens (
     id                   SERIAL PRIMARY KEY,
-    cnpj                 VARCHAR(14)   NOT NULL,
+    cnpj                 TEXT          NOT NULL,       -- um ou mais CNPJs separados por virgula
     token_hash           CHAR(64)      NOT NULL UNIQUE,  -- SHA-256 hex do raw token
     criado_em            TIMESTAMPTZ   NOT NULL DEFAULT now(),
     expira_em            TIMESTAMPTZ   NOT NULL,
     usado_em             TIMESTAMPTZ,
-    device_id_autorizado VARCHAR(64),   -- device_id informado pelo operador ao gerar o token
+    device_id_autorizado TEXT,          -- um ou mais device_ids separados por virgula
     device_id_usado      VARCHAR(64),   -- device_id que efetivamente usou o token
     gerado_por           VARCHAR(100)
 );
@@ -19,6 +19,10 @@ CREATE TABLE IF NOT EXISTS activation_tokens (
 -- Se a tabela já existir, adicionar a coluna nova sem recriar:
 ALTER TABLE activation_tokens
     ADD COLUMN IF NOT EXISTS device_id_autorizado VARCHAR(64);
+
+ALTER TABLE activation_tokens
+    ALTER COLUMN cnpj TYPE TEXT,
+    ALTER COLUMN device_id_autorizado TYPE TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_act_tokens_cnpj
     ON activation_tokens(cnpj);

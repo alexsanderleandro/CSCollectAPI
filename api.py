@@ -12,8 +12,10 @@ import hmac
 import io
 import json
 import os
+import re
 import zipfile
 from datetime import datetime, timedelta, timezone
+import pytz
 
 # Carrega .env local se existir (útil para desenvolvimento)
 try:
@@ -52,7 +54,7 @@ def _limpar_expirados():
     e contagens cujo data_envio seja anterior a (agora - EXPIRACAO_HORAS).
     Executado em background pela tarefa assíncrona.
     """
-    limite = datetime.now(timezone.utc) - timedelta(hours=EXPIRACAO_HORAS)
+    limite = datetime.now(pytz.timezone('America/Sao_Paulo')) - timedelta(hours=EXPIRACAO_HORAS)
 
     db = Session()
     try:
@@ -191,6 +193,9 @@ def validar_sig_bytes(zip_bytes: bytes, token_cliente: str) -> dict:
                 expected_sig = hmac.new(chave, payload_bytes, hashlib.sha256).hexdigest()
                 if not hmac.compare_digest(expected_sig, assinatura):
                     erros.append('Assinatura HMAC inválida — token não confere ou payload adulterado')
+                    print(f"[validar_sig] HMAC FAIL cnpj={payload.get('cnpj')} "
+                          f"key_len={len(chave)} serial_pref={serial[:6]} "
+                          f"esperado={expected_sig[:12]} recebido={assinatura[:12]}")
             # se serial vazio, omite validação HMAC e verifica apenas integridade
 
             # 4. Helper SHA-256 de entrada do ZIP
@@ -235,12 +240,24 @@ def validar_sig_bytes(zip_bytes: bytes, token_cliente: str) -> dict:
 
 
 def _buscar_token_cliente(db, cnpj: str) -> str:
-    """Retorna o token da licença do cliente pelo CNPJ, ou string vazia se não encontrado."""
+    """Retorna o token da licença do cliente pelo CNPJ (normalizado, só dígitos).
+
+    Normaliza o CNPJ para só-dígitos nos dois lados da comparação para tolerar
+    pontuação/espaços na coluna `clientes.cnpj` — espelhando a busca lenient do
+    app (que usa `LIKE %cnpj%`), mas sem o risco de falso-positivo de substring.
+    """
+    cnpj_digits = re.sub(r'\D', '', cnpj or '')
     row = db.execute(
-        text("SELECT token FROM clientes WHERE cnpj = :cnpj"),
-        {"cnpj": cnpj}
+        text("SELECT token FROM clientes "
+             "WHERE regexp_replace(cnpj, '[^0-9]', '', 'g') = :cnpj LIMIT 1"),
+        {"cnpj": cnpj_digits},
     ).fetchone()
-    return row[0] if row else ''
+    if not row:
+        print(f"[upload-contagem] cliente NAO encontrado cnpj={cnpj!r} digits={cnpj_digits}")
+        return ''
+    tok = (row[0] or '').strip()
+    print(f"[upload-contagem] cliente OK cnpj={cnpj_digits} token_len={len(tok)} pref={tok[:6]}")
+    return tok
 
 
 # ==============================
@@ -315,7 +332,7 @@ async def upload(
         ).fetchone()
         cliente_id = row[0] if row else None
 
-        data_envio = datetime.now(timezone.utc)
+        data_envio = datetime.now(pytz.timezone('America/Sao_Paulo'))
 
         db.execute(
             text("""
@@ -389,7 +406,7 @@ def ultima(
         "id": carga[0],
         "nome_arquivo": carga[1],
         "url_arquivo": carga[2],
-        "data_envio": str(carga[3]),
+        "data_envio": carga[3].replace(tzinfo=pytz.utc).astimezone(pytz.timezone('America/Sao_Paulo')).strftime('%Y-%m-%d %H:%M:%S%z'), # CONVERSÃO DE FUSO HORÁRIO
         "codvendedor": carga[4]
     }
 
@@ -532,7 +549,7 @@ async def upload_contagem(
 
     db = Session()
     try:
-        data_envio = datetime.now(timezone.utc)
+        data_envio = datetime.now(pytz.timezone('America/Sao_Paulo'))
 
         db.execute(
             text("""
@@ -591,7 +608,7 @@ def ultima_contagem(
     return {
         "nome_arquivo": contagem[0],
         "url_arquivo": contagem[1],
-        "data_envio": str(contagem[2])
+        "data_envio": contagem[2].replace(tzinfo=pytz.utc).astimezone(pytz.timezone('America/Sao_Paulo')).strftime('%Y-%m-%d %H:%M:%S%z') # CONVERSÃO DE FUSO HORÁRIO
     }
 
 # ------------------------------
@@ -678,7 +695,7 @@ def listar_contagens(cnpj: str, authorization: str = Header(...)):
             "idcelular": r[2],
             "nome_arquivo": r[3],
             "url_arquivo": r[4],
-            "data_envio": str(r[5]) if r[5] else None,
+            "data_envio": r[5].replace(tzinfo=pytz.utc).astimezone(pytz.timezone('America/Sao_Paulo')).strftime('%Y-%m-%d %H:%M:%S%z') if r[5] else None, # CONVERSÃO DE FUSO HORÁRIO
         }
         for r in rows
     ]
@@ -990,8 +1007,9 @@ def ativar_online(req: AtivarOnlineRequest, request: Request):
         if cnpj not in tok_cnpjs and tok_cnpj != cnpj:
             return {'ok': False, 'motivo': 'token_cnpj_mismatch', 'mensagem': 'Token nao pertence ao CNPJ informado'}
 
-        # Verificar device_id: deve bater com o autorizado pelo operador
-        if tok_dev_autorizado and tok_dev_autorizado.strip() != device_id:
+        # Verificar device_id: deve bater com um dos autorizados pelo operador
+        ids_autorizados = [x.strip() for x in str(tok_dev_autorizado or '').split(',') if x.strip()]
+        if ids_autorizados and device_id not in ids_autorizados:
             return {
                 'ok': False,
                 'motivo': 'device_id_nao_autorizado',

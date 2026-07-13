@@ -1,0 +1,14 @@
+.venv/
+venv/
+__pycache__/
+.git/
+dist/
+build/
+node_modules/
+logs/
+backup/
+temp/
+*.xlsx
+*.csv
+*.parquet
+*.pdf
