@@ -242,14 +242,22 @@ def validar_sig_bytes(zip_bytes: bytes, token_cliente: str) -> dict:
 def _buscar_token_cliente(db, cnpj: str) -> str:
     """Retorna o token da licença do cliente pelo CNPJ (normalizado, só dígitos).
 
-    Normaliza o CNPJ para só-dígitos nos dois lados da comparação para tolerar
-    pontuação/espaços na coluna `clientes.cnpj` — espelhando a busca lenient do
-    app (que usa `LIKE %cnpj%`), mas sem o risco de falso-positivo de substring.
+    A coluna `clientes.cnpj` pode conter múltiplos CNPJs separados por vírgula
+    (mesmo padrão usado em `idcelular` nas rotas de carga). Por isso o valor é
+    dividido por vírgula e cada parte é normalizada e comparada individualmente
+    — normalizar a coluna inteira de uma vez removeria a vírgula e fundiria os
+    CNPJs, impedindo qualquer match exato.
     """
     cnpj_digits = re.sub(r'\D', '', cnpj or '')
     row = db.execute(
-        text("SELECT token FROM clientes "
-             "WHERE regexp_replace(cnpj, '[^0-9]', '', 'g') = :cnpj LIMIT 1"),
+        text("""
+            SELECT token FROM clientes
+            WHERE :cnpj IN (
+                SELECT regexp_replace(x, '[^0-9]', '', 'g')
+                FROM unnest(string_to_array(cnpj, ',')) AS x
+            )
+            LIMIT 1
+        """),
         {"cnpj": cnpj_digits},
     ).fetchone()
     if not row:
