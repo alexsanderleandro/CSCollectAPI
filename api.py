@@ -7,6 +7,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import asyncio
+import base64
 import hashlib
 import hmac
 import io
@@ -16,6 +17,23 @@ import re
 import zipfile
 from datetime import datetime, timedelta, timezone
 import pytz
+
+from Crypto.PublicKey import RSA
+from Crypto.Signature import pkcs1_15
+from Crypto.Hash import SHA256
+
+# Chave pública fixa do app mobile (LogScan) — verifica a assinatura RSA do
+# .db de contagens exportado (par gerado em CSCollect/security/export_db_signing.py;
+# a chave privada correspondente só existe no app, nunca aqui).
+_EXPORT_DB_PUBLIC_KEY_PEM = """-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzWvISBG0DElIbeXn5GoB
+NXGBz0NHBde4eLm87Rf3rtc82cR8P7j/P4lVce2FGTL2HmL3ZV8WZ7YdXW3CZ9YF
+5mwMZnfgZxZNbcfYM7rGyoBh8ejyGhTJU3xvBuqSY0zM2DLXBYeL81isefGIQUKw
+u/JKmTtJlntjzuyyU0iPyGwuC9Txz6w688Z3xAWoYMyhHMxz2PoOco937D7BEkDO
+2yuq7aRvNXB4fT1s17kfSEhftOQl5LtSrDesyZMhAmSAbjWARhD+afumzFxPoHGI
+GcD2U7DIQi3Kkkly4BPwYW+7C5quNkqottp7Fxvln2rd4+5240U2vHtg7HqMOFeu
+PQIDAQAB
+-----END PUBLIC KEY-----"""
 
 # Carrega .env local se existir (útil para desenvolvimento)
 try:
@@ -48,13 +66,18 @@ EXPIRACAO_HORAS = 3
 INTERVALO_LIMPEZA_SEGUNDOS = 5 * 60  # verifica a cada 5 minutos
 
 
+def _limite_validade() -> datetime:
+    """Timestamp de corte: registros com data_envio anterior a isso estão expirados."""
+    return datetime.now(pytz.timezone('America/Sao_Paulo')) - timedelta(hours=EXPIRACAO_HORAS)
+
+
 def _limpar_expirados():
     """
     Remove do banco (Neon) e do disco (Render) todos os registros de cargas
     e contagens cujo data_envio seja anterior a (agora - EXPIRACAO_HORAS).
     Executado em background pela tarefa assíncrona.
     """
-    limite = datetime.now(pytz.timezone('America/Sao_Paulo')) - timedelta(hours=EXPIRACAO_HORAS)
+    limite = _limite_validade()
 
     db = Session()
     try:
@@ -206,14 +229,30 @@ def validar_sig_bytes(zip_bytes: bytes, token_cliente: str) -> dict:
                         h.update(chunk)
                 return h.hexdigest()
 
-            # TXT
-            txt_names = [n for n in names if n.endswith('.txt')]
-            if txt_names:
-                h = _sha256_entry(txt_names[0])
-                if h != payload.get('hash_txt', ''):
-                    erros.append(f'Hash TXT diverge: esperado={payload.get("hash_txt")} calculado={h}')
+            # DB (contagens)
+            db_names = [n for n in names if n.endswith('.db')]
+            if db_names:
+                h = _sha256_entry(db_names[0])
+                if h != payload.get('hash_db', ''):
+                    erros.append(f'Hash DB diverge: esperado={payload.get("hash_db")} calculado={h}')
+
+                # Assinatura RSA do .db (a mesma que o ERP VB6 verifica offline) —
+                # validada aqui também como camada extra de integridade no recebimento.
+                assinatura_rsa = doc.get('assinatura_rsa', '')
+                if assinatura_rsa:
+                    try:
+                        db_bytes = zf.read(db_names[0])
+                        digest = SHA256.new(db_bytes)
+                        chave_pub = RSA.import_key(_EXPORT_DB_PUBLIC_KEY_PEM)
+                        pkcs1_15.new(chave_pub).verify(digest, base64.b64decode(assinatura_rsa))
+                    except (ValueError, TypeError):
+                        erros.append('Assinatura RSA do .db inválida — arquivo pode ter sido alterado')
+                    except Exception as e:
+                        erros.append(f'Erro ao verificar assinatura RSA do .db: {e}')
+                else:
+                    erros.append('Assinatura RSA do .db ausente no .sig')
             else:
-                erros.append('Arquivo TXT não encontrado no ZIP')
+                erros.append('Arquivo .db não encontrado no ZIP')
 
             # PDF (opcional)
             pdf_names = [n for n in names if n.endswith('.pdf')]
@@ -388,7 +427,7 @@ def ultima(
     db = Session()
     try:
         placeholders = ", ".join(f":id{i}" for i in range(len(ids)))
-        params: dict = {"cnpj": cnpj, "codvendedor": codvendedor}
+        params: dict = {"cnpj": cnpj, "codvendedor": codvendedor, "limite": _limite_validade()}
         for i, v in enumerate(ids):
             params[f"id{i}"] = v
 
@@ -399,6 +438,7 @@ def ultima(
                 WHERE cnpj = :cnpj
                   AND codvendedor = :codvendedor
                   AND idcelular IN ({placeholders})
+                  AND data_envio >= :limite
                 ORDER BY data_envio DESC
                 LIMIT 1
             """),
@@ -428,11 +468,50 @@ def download(cnpj: str, codvendedor: str, nome: str, authorization: str = Header
     caminho = os.path.join(BASE_DIR, cnpj, codvendedor, nome)
 
     if not os.path.exists(caminho):
+        # Arquivo sumiu do disco (ex.: redeploy/restart no Render, que tem
+        # filesystem efêmero) mas o registro no banco (Neon, persistente)
+        # ainda existe. Sem isso, /ultima continuaria reportando este mesmo
+        # arquivo morto por até EXPIRACAO_HORAS, prendendo o cliente num
+        # loop de 404. Apaga o registro órfão na hora, mesmo padrão do
+        # ramo de carga expirada logo abaixo.
+        db = Session()
+        try:
+            db.execute(
+                text(
+                    "DELETE FROM cargas "
+                    "WHERE cnpj = :cnpj AND codvendedor = :codvendedor AND nome_arquivo = :nome"
+                ),
+                {"cnpj": cnpj, "codvendedor": codvendedor, "nome": nome}
+            )
+            db.commit()
+        finally:
+            db.close()
         raise HTTPException(status_code=404, detail="Arquivo não encontrado")
 
-    # Remove o registro do banco antes de servir o arquivo
+    # Verifica validade e remove o registro do banco antes de servir o arquivo
     db = Session()
     try:
+        row = db.execute(
+            text(
+                "SELECT data_envio FROM cargas "
+                "WHERE cnpj = :cnpj AND codvendedor = :codvendedor AND nome_arquivo = :nome"
+            ),
+            {"cnpj": cnpj, "codvendedor": codvendedor, "nome": nome}
+        ).fetchone()
+
+        if not row or row[0] < _limite_validade():
+            db.execute(
+                text(
+                    "DELETE FROM cargas "
+                    "WHERE cnpj = :cnpj AND codvendedor = :codvendedor AND nome_arquivo = :nome"
+                ),
+                {"cnpj": cnpj, "codvendedor": codvendedor, "nome": nome}
+            )
+            db.commit()
+            if os.path.isfile(caminho):
+                os.remove(caminho)
+            raise HTTPException(status_code=404, detail="Carga expirada ou não encontrada")
+
         db.execute(
             text(
                 "DELETE FROM cargas "
@@ -602,10 +681,11 @@ def ultima_contagem(
                 SELECT nome_arquivo, url_arquivo, data_envio
                 FROM contagens
                 WHERE cnpj = :cnpj AND idcelular = :idcelular
+                  AND data_envio >= :limite
                 ORDER BY data_envio DESC
                 LIMIT 1
             """),
-            {"cnpj": cnpj, "idcelular": idcelular}
+            {"cnpj": cnpj, "idcelular": idcelular, "limite": _limite_validade()}
         ).fetchone()
     finally:
         db.close()
@@ -630,6 +710,33 @@ def download_contagem(cnpj: str, idcelular: str, nome: str, authorization: str =
 
     if not os.path.exists(caminho):
         raise HTTPException(status_code=404, detail="Arquivo não encontrado")
+
+    # Verifica validade antes de servir
+    db_chk = Session()
+    try:
+        row = db_chk.execute(
+            text(
+                "SELECT data_envio FROM contagens "
+                "WHERE cnpj = :cnpj AND idcelular = :idcelular AND nome_arquivo = :nome"
+            ),
+            {"cnpj": cnpj, "idcelular": idcelular, "nome": nome}
+        ).fetchone()
+
+        if not row or row[0] < _limite_validade():
+            if row:
+                db_chk.execute(
+                    text(
+                        "DELETE FROM contagens "
+                        "WHERE cnpj = :cnpj AND idcelular = :idcelular AND nome_arquivo = :nome"
+                    ),
+                    {"cnpj": cnpj, "idcelular": idcelular, "nome": nome}
+                )
+                db_chk.commit()
+            if os.path.isfile(caminho):
+                os.remove(caminho)
+            raise HTTPException(status_code=404, detail="Contagem expirada ou não encontrada")
+    finally:
+        db_chk.close()
 
     # Re-validar assinatura .sig antes de servir o arquivo
     with open(caminho, "rb") as f:
@@ -689,9 +796,10 @@ def listar_contagens(cnpj: str, authorization: str = Header(...)):
                 SELECT id, cnpj, idcelular, nome_arquivo, url_arquivo, data_envio
                   FROM contagens
                  WHERE cnpj = :cnpj
+                   AND data_envio >= :limite
                  ORDER BY data_envio DESC
             """),
-            {"cnpj": cnpj}
+            {"cnpj": cnpj, "limite": _limite_validade()}
         ).fetchall()
     finally:
         db.close()

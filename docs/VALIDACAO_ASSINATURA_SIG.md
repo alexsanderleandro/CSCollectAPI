@@ -1,6 +1,12 @@
 # Validação do Arquivo `.sig` — CSCollect
 
-Este documento descreve o formato do arquivo de assinatura `.sig` gerado pelo app CSCollect em cada exportação via API, e como o **manager/retaguarda** deve validá-lo antes de processar o ZIP recebido.
+Este documento descreve o formato do arquivo de assinatura `.sig` gerado pelo app CSCollect em cada exportação via API, e como o **manager/retaguarda** (CSCollectAPI) deve validá-lo antes de processar o ZIP recebido.
+
+> Este `.sig` cobre a validação feita pela **CSCollectAPI** no recebimento do upload
+> (HMAC + hashes + assinatura RSA do `.db`). Para o passo a passo de validação da
+> assinatura RSA do `.db` do ponto de vista do **ERP retaguarda (VB6)**, que só
+> tem a chave pública e não fala com esta API, veja
+> [`VALIDACAO_ASSINATURA_DB_CONTAGEM.md`](./VALIDACAO_ASSINATURA_DB_CONTAGEM.md).
 
 ---
 
@@ -9,16 +15,18 @@ Este documento descreve o formato do arquivo de assinatura `.sig` gerado pelo ap
 Cada ZIP enviado pelo app contém, no mínimo:
 
 ```
-MOD1_1_043_65381113000120_070520261714.zip
-├── MOD1_1_043_65381113000120_070520261714.txt   ← contagem em texto plano
-├── MOD1_1_043_65381113000120_070520261714.pdf   ← relatório PDF (se gerado)
-├── MOD1_1_043_65381113000120_070520261714.sig   ← assinatura (JSON)
-└── fotos/                                        ← fotos de produtos (opcional)
+CONTAGEM_1_043_65381113000120_070520261714.zip
+├── CONTAGEM_1_043_65381113000120_070520261714.db    ← contagens (SQLite: Empresa/Vendedor/Produtos)
+├── CONTAGEM_1_043_65381113000120_070520261714.pdf   ← relatório PDF (se gerado)
+├── CONTAGEM_1_043_65381113000120_070520261714.sig   ← assinatura (JSON)
+└── fotos/                                            ← fotos de produtos (opcional)
     ├── produto_7891234560012.jpg
     └── ...
 ```
 
-> O `.sig` é **sempre** gerado. O PDF e as fotos são opcionais.
+> O `.sig` é **sempre** gerado. O PDF e as fotos são opcionais. O `.db` substituiu
+> o antigo TXT (Modelo 1/2) — ver schema em
+> [`VALIDACAO_ASSINATURA_DB_CONTAGEM.md`](./VALIDACAO_ASSINATURA_DB_CONTAGEM.md).
 
 ---
 
@@ -29,20 +37,22 @@ O `.sig` é um arquivo JSON com dois campos raiz:
 ```json
 {
   "assinatura": "<hex HMAC-SHA256 do payload>",
+  "assinatura_rsa": "<base64 — assinatura RSA-2048/PKCS1v15-SHA256 do arquivo .db>",
   "payload": {
     "algoritmo":       "HMAC-SHA256",
+    "algoritmo_rsa":   "RSA-2048/PKCS1v15-SHA256",
     "codempresa":      "1",
     "codvendedor":     "043",
     "cnpj":            "65381113000120",
     "hash_assinatura": "<sha256 da imagem de assinatura digital>",
+    "hash_db":         "<sha256 do .db>",
     "hash_fotos": {
       "fotos/produto_7891234560012.jpg": "<sha256>"
     },
     "hash_pdf":        "<sha256 do PDF, ou vazio>",
-    "hash_txt":        "<sha256 do TXT>",
     "idcelular":       "<device id do coletor>",
-    "modelo":          "MOD1",
-    "nome_arquivo":    "MOD1_1_043_65381113000120_070520261714.zip",
+    "modelo":          "CONTAGEM",
+    "nome_arquivo":    "CONTAGEM_1_043_65381113000120_070520261714.zip",
     "serial":          "<token da licença do cliente>",
     "timestamp":       "2026-05-07T17:14:00",
     "versao":          "26.05.07 rev. 3"
@@ -54,20 +64,26 @@ O `.sig` é um arquivo JSON com dois campos raiz:
 
 | Campo | Tipo | Descrição |
 |---|---|---|
-| `algoritmo` | string | Sempre `"HMAC-SHA256"` |
+| `algoritmo` | string | Sempre `"HMAC-SHA256"` — algoritmo da assinatura de nível `assinatura` (confiança API↔dispositivo) |
+| `algoritmo_rsa` | string | Sempre `"RSA-2048/PKCS1v15-SHA256"` — algoritmo da assinatura de nível `assinatura_rsa` (confiança ERP↔arquivo) |
 | `codempresa` | string | Código da empresa configurado no app |
 | `codvendedor` | string | Código do usuário/vendedor |
 | `cnpj` | string | CNPJ sem pontuação (`65381113000120`) |
 | `hash_assinatura` | string hex | SHA-256 dos bytes brutos da imagem de assinatura digital capturada no app |
+| `hash_db` | string hex | SHA-256 do arquivo `.db` de contagens |
 | `hash_fotos` | object | Mapa `{ "fotos/<filename>": "<sha256>" }` de cada foto incluída no ZIP. Vazio `{}` se sem fotos |
 | `hash_pdf` | string hex | SHA-256 do arquivo PDF. String vazia `""` se PDF não foi gerado |
-| `hash_txt` | string hex | SHA-256 do arquivo TXT de contagem |
 | `idcelular` | string | Identificador único do dispositivo coletor |
-| `modelo` | string | `"MOD1"` ou `"MOD2"` |
+| `modelo` | string | Sempre `"CONTAGEM"` |
 | `nome_arquivo` | string | Nome exato do arquivo ZIP |
 | `serial` | string | Token da licença (campo `token` do arquivo `.key`) |
 | `timestamp` | string | ISO 8601 — `YYYY-MM-DDTHH:MM:SS` do momento da exportação |
 | `versao` | string | Versão do app CSCollect que gerou o arquivo |
+
+### Duas assinaturas, dois propósitos
+
+- **`assinatura`** (HMAC-SHA256, campo raiz do `.sig`, chaveada pelo `serial`): prova que o upload veio de um dispositivo com licença ativa. Só quem tem o token do cliente consegue recalculá-la — é a confiança **API ↔ dispositivo**, validada nesta API no recebimento (seção 3).
+- **`assinatura_rsa`** (RSA-2048/PKCS1v15-SHA256 sobre os bytes do `.db`, chave privada fixa do app): prova que o `.db` não foi alterado manualmente após a exportação. É verificável **offline**, só com a chave pública (sem precisar de token/API) — é a que o **ERP retaguarda (VB6)** usa. Ver [`VALIDACAO_ASSINATURA_DB_CONTAGEM.md`](./VALIDACAO_ASSINATURA_DB_CONTAGEM.md).
 
 ---
 
@@ -99,12 +115,23 @@ A **chave HMAC** é o valor do campo `serial` (token da licença do cliente), co
 Após validar a assinatura HMAC, calcular SHA-256 de cada arquivo extraído do ZIP e comparar com os hashes declarados no payload:
 
 ```
-hash_sha256(arquivo.txt) == payload.hash_txt
+hash_sha256(arquivo.db)  == payload.hash_db
 hash_sha256(arquivo.pdf) == payload.hash_pdf   (se hash_pdf != "")
 hash_sha256(fotos/X.jpg) == payload.hash_fotos["fotos/X.jpg"]
 ```
 
 Se qualquer hash divergir, o arquivo foi **adulterado** após a geração.
+
+### 3.4 Validação da assinatura RSA do `.db` (opcional nesta API, obrigatória no ERP)
+
+Além do hash acima (que só detecta alteração, sem provar autenticidade sozinho —
+qualquer um pode recalcular um SHA-256), o `.sig` traz `assinatura_rsa`: a
+assinatura RSA-2048/PKCS1v15-SHA256 dos bytes do `.db`, feita com a chave
+privada fixa do app. Verificar com a chave pública (`export_db_public_key.pem`,
+neste mesmo diretório) prova que o `.db` foi gerado pelo app e não foi
+alterado — é essa verificação que o ERP retaguarda (VB6) faz, sem precisar
+de token nem de rede. Detalhe completo em
+[`VALIDACAO_ASSINATURA_DB_CONTAGEM.md`](./VALIDACAO_ASSINATURA_DB_CONTAGEM.md).
 
 ---
 
@@ -163,14 +190,14 @@ def validar_sig(zip_path: str, token_cliente: str) -> dict:
                     h.update(chunk)
             return h.hexdigest()
 
-        # TXT
-        txt_names = [n for n in names if n.endswith('.txt')]
-        if txt_names:
-            h = _sha256_zip_entry(zf, txt_names[0])
-            if h != payload.get('hash_txt', ''):
-                erros.append(f'Hash TXT diverge: esperado={payload.get("hash_txt")} calculado={h}')
+        # DB (contagens)
+        db_names = [n for n in names if n.endswith('.db')]
+        if db_names:
+            h = _sha256_zip_entry(zf, db_names[0])
+            if h != payload.get('hash_db', ''):
+                erros.append(f'Hash DB diverge: esperado={payload.get("hash_db")} calculado={h}')
         else:
-            erros.append('Arquivo TXT não encontrado no ZIP')
+            erros.append('Arquivo .db não encontrado no ZIP')
 
         # PDF (opcional)
         pdf_names = [n for n in names if n.endswith('.pdf')]
@@ -268,10 +295,10 @@ export function validarSig(zipPath: string, tokenCliente: string): ValidationRes
     const name = entry.entryName;
     const data = entry.getData();
 
-    if (name.endsWith('.txt')) {
+    if (name.endsWith('.db')) {
       const h = sha256Buffer(data);
-      if (h !== payload['hash_txt']) {
-        erros.push(`Hash TXT diverge: esperado=${payload['hash_txt']} calculado=${h}`);
+      if (h !== payload['hash_db']) {
+        erros.push(`Hash DB diverge: esperado=${payload['hash_db']} calculado=${h}`);
       }
     } else if (name.endsWith('.pdf') && payload['hash_pdf']) {
       const h = sha256Buffer(data);
@@ -313,7 +340,8 @@ function canonicalJson(obj: unknown): string {
 |---|---|
 | `Arquivo .sig não encontrado no ZIP` | ZIP corrompido, versão antiga do app, ou envio incompleto |
 | `Assinatura HMAC inválida` | Token errado no banco, payload modificado em trânsito, ou serial incorreto no `.key` |
-| `Hash TXT diverge` | Arquivo TXT substituído ou corrompido após a geração |
+| `Hash DB diverge` | Arquivo `.db` substituído ou corrompido após a geração |
+| `Assinatura RSA do .db inválida` | `.db` alterado manualmente (edição direta no SQLite) após a exportação, ou `.sig`/`.db` de origens diferentes |
 | `Hash PDF diverge` | Arquivo PDF substituído ou corrompido após a geração |
 | `Hash foto diverge` | Foto substituída ou corrompida após a geração |
 | `Foto declarada no .sig não encontrada no ZIP` | Arquivo removido do ZIP após a geração |
@@ -343,7 +371,7 @@ Receber ZIP via upload
       SUCESSO
         │
         ▼
-  Processar contagem (importar TXT, armazenar PDF, etc.)
+  Processar contagem (armazenar .db, PDF, etc.)
         │
         ▼
   Retornar 200 OK com url_arquivo
