@@ -63,7 +63,7 @@ Session = sessionmaker(bind=engine)
 # ==============================
 
 EXPIRACAO_HORAS = 3
-INTERVALO_LIMPEZA_SEGUNDOS = 5 * 60  # verifica a cada 5 minutos
+INTERVALO_LIMPEZA_SEGUNDOS = 60 * 60  # verifica a cada 60 minutos
 
 
 def _limite_validade() -> datetime:
