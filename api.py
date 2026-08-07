@@ -499,7 +499,7 @@ def download(cnpj: str, codvendedor: str, nome: str, authorization: str = Header
             {"cnpj": cnpj, "codvendedor": codvendedor, "nome": nome}
         ).fetchone()
 
-        if not row or row[0] < _limite_validade():
+        if not row or row[0].replace(tzinfo=pytz.utc) < _limite_validade():
             db.execute(
                 text(
                     "DELETE FROM cargas "
@@ -722,7 +722,7 @@ def download_contagem(cnpj: str, idcelular: str, nome: str, authorization: str =
             {"cnpj": cnpj, "idcelular": idcelular, "nome": nome}
         ).fetchone()
 
-        if not row or row[0] < _limite_validade():
+        if not row or row[0].replace(tzinfo=pytz.utc) < _limite_validade():
             if row:
                 db_chk.execute(
                     text(
