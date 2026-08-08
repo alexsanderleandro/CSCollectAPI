@@ -66,9 +66,26 @@ EXPIRACAO_HORAS = 3
 INTERVALO_LIMPEZA_SEGUNDOS = 60 * 60  # verifica a cada 60 minutos
 
 
+def _agora_local() -> datetime:
+    """Agora no fuso de São Paulo, sem tzinfo.
+
+    As colunas ``data_envio`` são ``timestamp without time zone`` e guardam a
+    hora local de São Paulo. Comparar com um datetime *aware* faz o offset de
+    -03:00 entrar na conta duas vezes e derruba a validade para zero.
+    """
+    return datetime.now(pytz.timezone('America/Sao_Paulo')).replace(tzinfo=None)
+
+
 def _limite_validade() -> datetime:
     """Timestamp de corte: registros com data_envio anterior a isso estão expirados."""
-    return datetime.now(pytz.timezone('America/Sao_Paulo')) - timedelta(hours=EXPIRACAO_HORAS)
+    return _agora_local() - timedelta(hours=EXPIRACAO_HORAS)
+
+
+def _fmt_data_envio(dt):
+    """Formata um ``data_envio`` (naive, hora de São Paulo) já com o offset."""
+    if dt is None:
+        return None
+    return pytz.timezone('America/Sao_Paulo').localize(dt).strftime('%Y-%m-%d %H:%M:%S%z')
 
 
 def _limpar_expirados():
@@ -379,7 +396,7 @@ async def upload(
         ).fetchone()
         cliente_id = row[0] if row else None
 
-        data_envio = datetime.now(pytz.timezone('America/Sao_Paulo'))
+        data_envio = _agora_local()
 
         db.execute(
             text("""
@@ -454,7 +471,7 @@ def ultima(
         "id": carga[0],
         "nome_arquivo": carga[1],
         "url_arquivo": carga[2],
-        "data_envio": carga[3].replace(tzinfo=pytz.utc).astimezone(pytz.timezone('America/Sao_Paulo')).strftime('%Y-%m-%d %H:%M:%S%z'), # CONVERSÃO DE FUSO HORÁRIO
+        "data_envio": _fmt_data_envio(carga[3]),
         "codvendedor": carga[4]
     }
 
@@ -499,7 +516,7 @@ def download(cnpj: str, codvendedor: str, nome: str, authorization: str = Header
             {"cnpj": cnpj, "codvendedor": codvendedor, "nome": nome}
         ).fetchone()
 
-        if not row or row[0].replace(tzinfo=pytz.utc) < _limite_validade():
+        if not row or row[0] < _limite_validade():
             db.execute(
                 text(
                     "DELETE FROM cargas "
@@ -636,7 +653,7 @@ async def upload_contagem(
 
     db = Session()
     try:
-        data_envio = datetime.now(pytz.timezone('America/Sao_Paulo'))
+        data_envio = _agora_local()
 
         db.execute(
             text("""
@@ -696,7 +713,7 @@ def ultima_contagem(
     return {
         "nome_arquivo": contagem[0],
         "url_arquivo": contagem[1],
-        "data_envio": contagem[2].replace(tzinfo=pytz.utc).astimezone(pytz.timezone('America/Sao_Paulo')).strftime('%Y-%m-%d %H:%M:%S%z') # CONVERSÃO DE FUSO HORÁRIO
+        "data_envio": _fmt_data_envio(contagem[2])
     }
 
 # ------------------------------
@@ -722,7 +739,7 @@ def download_contagem(cnpj: str, idcelular: str, nome: str, authorization: str =
             {"cnpj": cnpj, "idcelular": idcelular, "nome": nome}
         ).fetchone()
 
-        if not row or row[0].replace(tzinfo=pytz.utc) < _limite_validade():
+        if not row or row[0] < _limite_validade():
             if row:
                 db_chk.execute(
                     text(
@@ -811,7 +828,7 @@ def listar_contagens(cnpj: str, authorization: str = Header(...)):
             "idcelular": r[2],
             "nome_arquivo": r[3],
             "url_arquivo": r[4],
-            "data_envio": r[5].replace(tzinfo=pytz.utc).astimezone(pytz.timezone('America/Sao_Paulo')).strftime('%Y-%m-%d %H:%M:%S%z') if r[5] else None, # CONVERSÃO DE FUSO HORÁRIO
+            "data_envio": _fmt_data_envio(r[5]),
         }
         for r in rows
     ]
