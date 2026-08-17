@@ -1027,6 +1027,50 @@ def _nome_arquivo_licenca(nome_cliente: str, cnpj: str) -> str:
     safe = ''.join(ch for ch in str(base) if ch.isalnum() or ch in (' ', '_', '-')).strip().replace(' ', '_')
     return f"Licenca_CSCollectManager_{safe or 'cliente'}.key"
 
+
+@app.get("/licenca/{cnpj}")
+def licenca(cnpj: str, authorization: str = Header(...)):
+    """Consulta rápida de status/validade/plano de um cliente, por CNPJ.
+
+    Uso interno (CSCollectManager) para sincronizar o .key local com o
+    Neon periodicamente — não exige device_id, diferente de /validar-licenca.
+    """
+    verificar_token(authorization)
+
+    cnpj = (cnpj or '').strip()
+    if not cnpj:
+        raise HTTPException(status_code=400, detail='cnpj é obrigatório')
+
+    db = Session()
+    try:
+        row = db.execute(
+            text("""
+                SELECT cnpj, ativo, validade, tipo_licenca, nome_cliente
+                FROM clientes
+                WHERE cnpj = :cnpj
+                   OR cnpj LIKE :like1 OR cnpj LIKE :like2 OR cnpj LIKE :like3
+                LIMIT 1
+            """),
+            {
+                "cnpj": cnpj,
+                "like1": f"%,{cnpj}", "like2": f"{cnpj},%", "like3": f"%,{cnpj},%",
+            }
+        ).fetchone()
+    finally:
+        db.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Cliente não encontrado")
+
+    return {
+        "cnpj": row.cnpj,
+        "ativo": bool(row.ativo),
+        "validade": row.validade.isoformat() if row.validade else None,
+        "tipo_licenca": row.tipo_licenca,
+        "nome_cliente": row.nome_cliente,
+    }
+
+
 @app.post("/validar-licenca")
 @limiter.limit("10/minute")
 def validar_licenca(req: ValidarLicencaRequest, request: Request):
