@@ -330,6 +330,47 @@ def _buscar_token_cliente(db, cnpj: str) -> str:
 
 API_TOKEN = os.getenv("API_TOKEN", "")
 
+# Chave que assina os tokens de licença. Necessária para /validar-sig conferir
+# se um `serial` vindo de um .sig é um token legítimo, mesmo que já tenha sido
+# substituído por uma regeração posterior (troca de plano, renovação).
+MASTER_KEY = (os.getenv("MASTER_KEY", "") or "").strip().strip("'\"")
+
+
+def _b64url_decode(s: str) -> bytes:
+    s = (s or "").replace('-', '+').replace('_', '/')
+    pad = 4 - len(s) % 4
+    if pad < 4:
+        s += '=' * pad
+    return base64.b64decode(s)
+
+
+def verificar_assinatura_token(token_str: str) -> dict:
+    """Valida a assinatura HMAC-SHA256 de um token de licença e devolve o payload.
+
+    Formato: ``Base64Url(JSON_payload).Base64Url(HMAC_SHA256)``, assinado com a
+    MASTER_KEY — mesma verificação que o coletor faz em `_verify_db_token`.
+
+    Só a MASTER_KEY permite forjar um token, então um token cuja assinatura
+    confere é autêntico mesmo que não seja mais o token corrente do cliente.
+
+    Levanta ValueError se o formato ou a assinatura forem inválidos.
+    """
+    if not MASTER_KEY:
+        raise ValueError('MASTER_KEY nao configurada no servidor')
+
+    parts = (token_str or '').strip().split('.')
+    if len(parts) != 2:
+        raise ValueError('Token com formato invalido (esperado payload.assinatura)')
+
+    payload_bytes = _b64url_decode(parts[0])
+    sig_recebida = _b64url_decode(parts[1])
+
+    esperada = hmac.new(MASTER_KEY.encode('utf-8'), payload_bytes, hashlib.sha256).digest()
+    if not hmac.compare_digest(esperada, sig_recebida):
+        raise ValueError('Assinatura do token invalida')
+
+    return json.loads(payload_bytes.decode('utf-8'))
+
 def _normalizar_token(raw: str) -> str:
     """Remove prefixo 'Bearer ' (case-insensitive) para normalizar comparação.
 
@@ -1045,7 +1086,8 @@ def licenca(cnpj: str, authorization: str = Header(...)):
     try:
         row = db.execute(
             text("""
-                SELECT cnpj, ativo, validade, tipo_licenca, nome_cliente
+                SELECT cnpj, ativo, validade, tipo_licenca, nome_cliente,
+                       token, arq_licenca
                 FROM clientes
                 WHERE cnpj = :cnpj
                    OR cnpj LIKE :like1 OR cnpj LIKE :like2 OR cnpj LIKE :like3
@@ -1068,6 +1110,76 @@ def licenca(cnpj: str, authorization: str = Header(...)):
         "validade": row.validade.isoformat() if row.validade else None,
         "tipo_licenca": row.tipo_licenca,
         "nome_cliente": row.nome_cliente,
+        # O token é a chave HMAC que assina o .sig das contagens. Sem ele o
+        # CSCollectManager fica com o token antigo no .key após uma renovação
+        # de licença e passa a rejeitar os arquivos do coletor como se
+        # estivessem adulterados. Protegido pelo mesmo verificar_token() das
+        # demais rotas.
+        "token": (row.token or "").strip(),
+        # Arquivo .key completo, como está no banco. Permite ao
+        # CSCollectManager regravar a licença local inteira a cada validação —
+        # mesma ideia da rotina do coletor, que rebaixa a licença e passa a
+        # trabalhar com os dados atualizados.
+        "arq_licenca": (row.arq_licenca or "").strip(),
+    }
+
+
+class ValidarSigRequest(BaseModel):
+    assinatura: str
+    payload: dict
+
+
+@app.post("/validar-sig")
+def validar_sig_endpoint(req: ValidarSigRequest, authorization: str = Header(...)):
+    """Confirma se um .sig foi assinado por um token de licença legítimo.
+
+    Existe porque o token do cliente é regerado a cada troca de plano ou
+    renovação: um arquivo assinado antes da regeração deixa de conferir com o
+    token corrente, embora seja perfeitamente autêntico. Como só quem tem a
+    MASTER_KEY consegue emitir um token válido, verificar a assinatura do
+    próprio `serial` prova a autenticidade do arquivo sem depender de qual
+    token está vigente — e sem distribuir a MASTER_KEY para as máquinas.
+    """
+    verificar_token(authorization)
+
+    payload = req.payload or {}
+    assinatura = (req.assinatura or '').strip()
+    serial = str(payload.get('serial') or '').strip()
+
+    if not serial or not assinatura:
+        return {'ok': False, 'motivo': 'sig_incompleto',
+                'mensagem': 'payload.serial e assinatura sao obrigatorios'}
+
+    # 1. O .sig é internamente consistente (não foi adulterado após a assinatura)?
+    payload_json = json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                              separators=(',', ':')).encode('utf-8')
+    esperado = hmac.new(serial.encode('utf-8'), payload_json, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(esperado, assinatura):
+        return {'ok': False, 'motivo': 'hmac_invalido',
+                'mensagem': 'Assinatura nao confere com o payload — arquivo adulterado'}
+
+    # 2. O serial é um token realmente emitido pela CEOsoftware?
+    try:
+        token_payload = verificar_assinatura_token(serial)
+    except ValueError as e:
+        return {'ok': False, 'motivo': 'token_nao_autentico', 'mensagem': str(e)}
+    except Exception as e:
+        return {'ok': False, 'motivo': 'erro_validacao_token', 'mensagem': str(e)}
+
+    # 3. O CNPJ do arquivo está entre os autorizados nesse token?
+    cnpj_arquivo = re.sub(r'\D', '', str(payload.get('cnpj') or ''))
+    cnpjs_token = [re.sub(r'\D', '', str(c)) for c in (token_payload.get('cnpjs') or [])]
+    if cnpj_arquivo and cnpjs_token and cnpj_arquivo not in cnpjs_token:
+        return {'ok': False, 'motivo': 'cnpj_nao_autorizado_no_token',
+                'mensagem': f'CNPJ {cnpj_arquivo} nao autorizado no token que assinou o arquivo'}
+
+    return {
+        'ok': True,
+        'motivo': '',
+        'mensagem': 'Assinatura autentica',
+        'validade_token': token_payload.get('validade', ''),
+        'tipo_licenca_token': token_payload.get('tipo_licenca', ''),
+        'gerado_em_token': token_payload.get('gerado_em', ''),
     }
 
 
