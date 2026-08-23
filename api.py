@@ -1001,6 +1001,52 @@ def _buscar_registro_licenca(db, cnpj: str):
     )
 
 
+def _buscar_registro_licenca_por_device(db, device_id: str):
+    """Busca o cliente cujo `device_id` conste em `idcelular`, sem precisar
+    saber o CNPJ de antemão.
+
+    Usado por /ativar-online-device (primeira ativação do app mobile: nesse
+    momento ainda não existe nenhuma licença local, então não há CNPJ para
+    filtrar — só o Device ID do aparelho, que o admin já deve ter cadastrado
+    manualmente em `clientes.idcelular` antes). Como não há um valor único
+    para o WHERE (idcelular é uma lista separada por vírgula, e o Device ID
+    pode estar em qualquer posição), busca todos os clientes ativos e casa
+    o Device ID em Python — mesma lógica de correspondência que
+    `_validar_e_montar_licenca` já faz internamente para `ids_no_banco`.
+    """
+    try:
+        rows = db.execute(
+            text("""
+                SELECT cnpj, idcelular, token, arq_licenca, validade, ativo, nome_cliente,
+                       sql_servidor, sql_banco, api_authorization, api_database_url
+                FROM clientes
+                WHERE ativo = true
+            """)
+        ).fetchall()
+    except Exception as e:
+        # Produção pode estar com schema legado (sem colunas novas). Mesmo
+        # fallback de _buscar_registro_licenca.
+        print(f"[licenca] query v6 (por device) falhou, tentando fallback legado: {e}")
+        rows_legacy = db.execute(
+            text("""
+                SELECT cnpj, idcelular, token, validade, ativo, nome_cliente,
+                       sql_servidor, sql_banco
+                FROM clientes
+                WHERE ativo = true
+            """)
+        ).fetchall()
+        rows = [
+            (r[0], r[1], r[2], '', r[3], r[4], r[5], r[6], r[7], '', '')
+            for r in rows_legacy
+        ]
+
+    for row in rows:
+        ids_no_banco = [x.strip() for x in str(row[1] or '').split(',') if x.strip()]
+        if device_id in ids_no_banco:
+            return row
+    return None
+
+
 def _validar_e_montar_licenca(row, cnpj: str, device_id: str):
     if not row:
         return {'ok': False, 'motivo': 'licenca_nao_encontrada_no_servidor', 'mensagem': 'CNPJ nao cadastrado'}
@@ -1340,5 +1386,53 @@ def ativar_online(req: AtivarOnlineRequest, request: Request):
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f'Erro interno: {e}')
+    finally:
+        db.close()
+
+
+class AtivarOnlineDeviceRequest(BaseModel):
+    device_id: str
+
+
+@app.post("/ativar-online-device")
+@limiter.limit("10/minute")
+def ativar_online_device(req: AtivarOnlineDeviceRequest, request: Request):
+    """Ativa o dispositivo só com o Device ID — sem CNPJ e sem token avulso
+    (diferente de /validar-licenca e /ativar-online, que exigem um dos dois).
+
+    Usado pelo botão "Ativar online" da tela de ativação inicial do app
+    mobile (CSCollect), quando ainda não existe nenhuma licença/.key local
+    para saber o CNPJ. Pré-requisito: o admin já cadastrou este Device ID em
+    `clientes.idcelular` (mesma exigência de qualquer forma de ativação —
+    aqui só muda COMO o cliente é encontrado, não se precisa de cadastro
+    prévio). Mesmo formato de resposta de /validar-licenca — reaproveita
+    _validar_e_montar_licenca integralmente.
+    """
+    device_id = (req.device_id or '').strip()
+    if not device_id:
+        return {'ok': False, 'motivo': 'parametros_invalidos', 'mensagem': 'device_id e obrigatorio'}
+
+    db = Session()
+    try:
+        row = _buscar_registro_licenca_por_device(db, device_id)
+        if not row:
+            return {
+                'ok': False,
+                'motivo': 'licenca_nao_encontrada_no_servidor',
+                'mensagem': 'Nenhum cliente ativo com este Device ID cadastrado',
+            }
+        # `cnpj` não é usado dentro de _validar_e_montar_licenca (só o
+        # `db_cnpj` vindo da própria linha) — não há um CNPJ conhecido de
+        # antemão nesse fluxo, por isso passamos vazio.
+        return _validar_e_montar_licenca(row, '', device_id)
+    except Exception as e:
+        # Mesmo cuidado de /validar-licenca: nunca devolver HTTP 500 sem
+        # corpo JSON (quebraria o parse no app mobile).
+        print(f"[licenca] ativar_online_device erro interno: {e}")
+        return {
+            'ok': False,
+            'motivo': 'erro_servidor_licenca',
+            'mensagem': 'Falha interna ao ativar. Tente novamente em instantes.',
+        }
     finally:
         db.close()
