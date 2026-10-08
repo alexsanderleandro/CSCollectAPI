@@ -1,6 +1,6 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -12,10 +12,11 @@ import hashlib
 import hmac
 import io
 import json
+import mimetypes
 import os
 import re
 import zipfile
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import pytz
 
 from Crypto.PublicKey import RSA
@@ -65,92 +66,137 @@ Session = sessionmaker(bind=engine)
 EXPIRACAO_HORAS = 3
 INTERVALO_LIMPEZA_SEGUNDOS = 60 * 60  # verifica a cada 60 minutos
 
+# O conteúdo das cargas e contagens fica no próprio Neon, na tabela
+# arquivos_transferencia — e não no disco do Render. O filesystem do Render é
+# efêmero: é apagado a cada redeploy/restart e, no plano free, sempre que a
+# instância hiberna após ~15 min sem requisições. Com os arquivos em disco, a
+# carga/contagem continuava registrada no banco mas o download dava 404 muito
+# antes das 3 horas.
+#
+# A validade é medida pelo `criado_em` (timestamptz, preenchido pelo Postgres)
+# contra `now()`, inteiramente no SQL: não depende do tipo nem do fuso das
+# colunas `data_envio`, que o app mobile também grava direto no Neon.
+_SQL_ARQUIVO_VALIDO = "a.criado_em >= now() - make_interval(hours => :horas)"
+
+
+def _garantir_tabela_arquivos():
+    """Cria a tabela de arquivos no primeiro startup após o deploy."""
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS arquivos_transferencia (
+                id           BIGSERIAL    PRIMARY KEY,
+                tipo         TEXT         NOT NULL,  -- 'carga' ou 'contagem'
+                cnpj         TEXT         NOT NULL,
+                pasta        TEXT         NOT NULL,  -- codvendedor (carga) / idcelular (contagem)
+                nome_arquivo TEXT         NOT NULL,
+                conteudo     BYTEA        NOT NULL,
+                criado_em    TIMESTAMPTZ  NOT NULL DEFAULT now(),
+                UNIQUE (tipo, cnpj, pasta, nome_arquivo)
+            )
+        """))
+
+
+def _salvar_arquivo(db, tipo: str, cnpj: str, pasta: str, nome: str, conteudo: bytes):
+    """Grava o arquivo; reenviar o mesmo nome substitui o conteúdo e renova a validade."""
+    db.execute(
+        text("""
+            INSERT INTO arquivos_transferencia (tipo, cnpj, pasta, nome_arquivo, conteudo)
+            VALUES (:tipo, :cnpj, :pasta, :nome, :conteudo)
+            ON CONFLICT (tipo, cnpj, pasta, nome_arquivo)
+            DO UPDATE SET conteudo = EXCLUDED.conteudo, criado_em = now()
+        """),
+        {"tipo": tipo, "cnpj": cnpj, "pasta": pasta, "nome": nome, "conteudo": conteudo}
+    )
+
+
+def _ler_arquivo(db, tipo: str, cnpj: str, pasta: str, nome: str):
+    """Conteúdo do arquivo, ou None se não existir ou já tiver expirado."""
+    row = db.execute(
+        text(f"""
+            SELECT a.conteudo FROM arquivos_transferencia a
+            WHERE a.tipo = :tipo AND a.cnpj = :cnpj AND a.pasta = :pasta
+              AND a.nome_arquivo = :nome AND {_SQL_ARQUIVO_VALIDO}
+        """),
+        {"tipo": tipo, "cnpj": cnpj, "pasta": pasta, "nome": nome, "horas": EXPIRACAO_HORAS}
+    ).fetchone()
+    return bytes(row[0]) if row else None
+
+
+def _remover_arquivo(db, tipo: str, cnpj: str, pasta: str, nome: str) -> bool:
+    """Apaga o arquivo. Retorna False se ele não existia."""
+    res = db.execute(
+        text("""
+            DELETE FROM arquivos_transferencia
+            WHERE tipo = :tipo AND cnpj = :cnpj AND pasta = :pasta AND nome_arquivo = :nome
+        """),
+        {"tipo": tipo, "cnpj": cnpj, "pasta": pasta, "nome": nome}
+    )
+    return res.rowcount > 0
+
+
+def _resposta_arquivo(conteudo: bytes, nome: str) -> Response:
+    media_type = mimetypes.guess_type(nome)[0] or "application/octet-stream"
+    return Response(content=conteudo, media_type=media_type)
+
 
 def _agora_local() -> datetime:
-    """Agora no fuso de São Paulo, sem tzinfo.
+    """Agora no fuso de São Paulo, sem tzinfo — valor gravado em ``data_envio``.
 
-    As colunas ``data_envio`` são ``timestamp without time zone`` e guardam a
-    hora local de São Paulo. Comparar com um datetime *aware* faz o offset de
-    -03:00 entrar na conta duas vezes e derruba a validade para zero.
+    ``data_envio`` serve só para exibição/ordenação; a validade de 3 horas é
+    controlada por ``arquivos_transferencia.criado_em``.
     """
     return datetime.now(pytz.timezone('America/Sao_Paulo')).replace(tzinfo=None)
 
 
-def _limite_validade() -> datetime:
-    """Timestamp de corte: registros com data_envio anterior a isso estão expirados."""
-    return _agora_local() - timedelta(hours=EXPIRACAO_HORAS)
-
-
 def _fmt_data_envio(dt):
-    """Formata um ``data_envio`` (naive, hora de São Paulo) já com o offset."""
+    """Formata um ``data_envio`` já com o offset de São Paulo.
+
+    Aceita tanto o valor naive (hora de São Paulo, gravado pela API) quanto
+    um aware (coluna ``timestamptz``).
+    """
     if dt is None:
         return None
-    return pytz.timezone('America/Sao_Paulo').localize(dt).strftime('%Y-%m-%d %H:%M:%S%z')
+    tz = pytz.timezone('America/Sao_Paulo')
+    dt = dt.astimezone(tz) if dt.tzinfo else tz.localize(dt)
+    return dt.strftime('%Y-%m-%d %H:%M:%S%z')
 
 
 def _limpar_expirados():
     """
-    Remove do banco (Neon) e do disco (Render) todos os registros de cargas
-    e contagens cujo data_envio seja anterior a (agora - EXPIRACAO_HORAS).
+    Apaga do banco (Neon) os arquivos com mais de EXPIRACAO_HORAS e as
+    referências em `cargas`/`contagens` que ficaram sem arquivo — expirado,
+    removido, ou de antes de os arquivos passarem a ficar no banco.
     Executado em background pela tarefa assíncrona.
     """
-    limite = _limite_validade()
-
     db = Session()
     try:
-        # ---- Cargas expiradas ----
-        cargas = db.execute(
-            text("""
-                SELECT cnpj, codvendedor, nome_arquivo
-                FROM cargas
-                WHERE data_envio < :limite
-            """),
-            {"limite": limite}
-        ).fetchall()
+        arquivos = db.execute(
+            text(f"DELETE FROM arquivos_transferencia a WHERE NOT ({_SQL_ARQUIVO_VALIDO})"),
+            {"horas": EXPIRACAO_HORAS}
+        ).rowcount
 
-        for row in cargas:
-            cnpj, codvendedor, nome = row[0], row[1], row[2]
-            caminho = os.path.join(BASE_DIR, cnpj, codvendedor, nome)
-            if os.path.isfile(caminho):
-                try:
-                    os.remove(caminho)
-                except Exception as e:
-                    print(f"[LIMPEZA] Erro ao remover arquivo de carga '{caminho}': {e}")
-
-        if cargas:
-            db.execute(
-                text("DELETE FROM cargas WHERE data_envio < :limite"),
-                {"limite": limite}
+        cargas = db.execute(text("""
+            DELETE FROM cargas c
+            WHERE NOT EXISTS (
+                SELECT 1 FROM arquivos_transferencia a
+                WHERE a.tipo = 'carga' AND a.cnpj = c.cnpj
+                  AND a.pasta = c.codvendedor AND a.nome_arquivo = c.nome_arquivo
             )
-            print(f"[LIMPEZA] {len(cargas)} carga(s) expirada(s) removida(s).")
+        """)).rowcount
 
-        # ---- Contagens expiradas ----
-        contagens = db.execute(
-            text("""
-                SELECT cnpj, idcelular, nome_arquivo
-                FROM contagens
-                WHERE data_envio < :limite
-            """),
-            {"limite": limite}
-        ).fetchall()
-
-        for row in contagens:
-            cnpj, idcelular, nome = row[0], row[1], row[2]
-            caminho = os.path.join("contagens", cnpj, idcelular, nome)
-            if os.path.isfile(caminho):
-                try:
-                    os.remove(caminho)
-                except Exception as e:
-                    print(f"[LIMPEZA] Erro ao remover arquivo de contagem '{caminho}': {e}")
-
-        if contagens:
-            db.execute(
-                text("DELETE FROM contagens WHERE data_envio < :limite"),
-                {"limite": limite}
+        contagens = db.execute(text("""
+            DELETE FROM contagens c
+            WHERE NOT EXISTS (
+                SELECT 1 FROM arquivos_transferencia a
+                WHERE a.tipo = 'contagem' AND a.cnpj = c.cnpj
+                  AND a.pasta = c.idcelular AND a.nome_arquivo = c.nome_arquivo
             )
-            print(f"[LIMPEZA] {len(contagens)} contagem(s) expirada(s) removida(s).")
+        """)).rowcount
 
         db.commit()
+        if arquivos or cargas or contagens:
+            print(f"[LIMPEZA] Removido(s): {arquivos} arquivo(s), "
+                  f"{cargas} carga(s), {contagens} contagem(s).")
     except Exception as e:
         db.rollback()
         print(f"[LIMPEZA] Erro durante limpeza: {e}")
@@ -159,18 +205,27 @@ def _limpar_expirados():
 
 
 async def _tarefa_limpeza():
-    """Loop assíncrono que executa a limpeza periódica de registros expirados."""
+    """Loop assíncrono que executa a limpeza periódica de registros expirados.
+
+    Limpa já no startup: no plano free do Render a instância hiberna após
+    ~15 min ociosa, então um loop que só limpasse depois da primeira hora
+    quase nunca chegaria a rodar.
+    """
     while True:
-        await asyncio.sleep(INTERVALO_LIMPEZA_SEGUNDOS)
         try:
-            _limpar_expirados()
+            await asyncio.to_thread(_limpar_expirados)
         except Exception as e:
             print(f"[LIMPEZA] Exceção não tratada na tarefa de limpeza: {e}")
+        await asyncio.sleep(INTERVALO_LIMPEZA_SEGUNDOS)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Inicia a tarefa de limpeza no startup e a cancela no shutdown."""
+    try:
+        _garantir_tabela_arquivos()
+    except Exception as e:
+        print(f"[ARQUIVOS] Falha ao criar a tabela arquivos_transferencia: {e}")
     tarefa = asyncio.create_task(_tarefa_limpeza())
     print(f"[LIMPEZA] Tarefa de limpeza iniciada (expiração: {EXPIRACAO_HORAS}h, intervalo: {INTERVALO_LIMPEZA_SEGUNDOS}s).")
     yield
@@ -187,10 +242,6 @@ app = FastAPI(lifespan=lifespan)
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-
-# garante pasta local
-BASE_DIR = "cargas"
-os.makedirs(BASE_DIR, exist_ok=True)
 
 # ==============================
 # VALIDAÇÃO DE ASSINATURA .SIG
@@ -416,15 +467,7 @@ async def upload(
 ):
     verificar_token(authorization)
 
-    # pasta organizada por cnpj/codvendedor
-    pasta = os.path.join(BASE_DIR, cnpj, codvendedor)
-    os.makedirs(pasta, exist_ok=True)
-
-    caminho = os.path.join(pasta, file.filename)
-
     conteudo = await file.read()
-    with open(caminho, "wb") as f:
-        f.write(conteudo)
 
     url_arquivo = f"/download/{cnpj}/{codvendedor}/{file.filename}"
 
@@ -439,6 +482,7 @@ async def upload(
 
         data_envio = _agora_local()
 
+        _salvar_arquivo(db, 'carga', cnpj, codvendedor, file.filename, conteudo)
         db.execute(
             text("""
                 INSERT INTO cargas (cnpj, nome_arquivo, url_arquivo, idcelular, codvendedor, cliente_id, data_envio)
@@ -485,19 +529,23 @@ def ultima(
     db = Session()
     try:
         placeholders = ", ".join(f":id{i}" for i in range(len(ids)))
-        params: dict = {"cnpj": cnpj, "codvendedor": codvendedor, "limite": _limite_validade()}
+        params: dict = {"cnpj": cnpj, "codvendedor": codvendedor, "horas": EXPIRACAO_HORAS}
         for i, v in enumerate(ids):
             params[f"id{i}"] = v
 
+        # Só lista carga cujo arquivo ainda está disponível para download.
         carga = db.execute(
             text(f"""
-                SELECT id, nome_arquivo, url_arquivo, data_envio, codvendedor
-                FROM cargas
-                WHERE cnpj = :cnpj
-                  AND codvendedor = :codvendedor
-                  AND idcelular IN ({placeholders})
-                  AND data_envio >= :limite
-                ORDER BY data_envio DESC
+                SELECT c.id, c.nome_arquivo, c.url_arquivo, c.data_envio, c.codvendedor
+                FROM cargas c
+                JOIN arquivos_transferencia a
+                  ON a.tipo = 'carga' AND a.cnpj = c.cnpj
+                 AND a.pasta = c.codvendedor AND a.nome_arquivo = c.nome_arquivo
+                WHERE c.cnpj = :cnpj
+                  AND c.codvendedor = :codvendedor
+                  AND c.idcelular IN ({placeholders})
+                  AND {_SQL_ARQUIVO_VALIDO}
+                ORDER BY a.criado_em DESC
                 LIMIT 1
             """),
             params
@@ -517,47 +565,19 @@ def ultima(
     }
 
 # ------------------------------
-# Download — deleta registro do Neon antes de servir
+# Download de carga
 # ------------------------------
 @app.get("/download/{cnpj}/{codvendedor}/{nome}")
 def download(cnpj: str, codvendedor: str, nome: str, authorization: str = Header(...)):
     verificar_token(authorization)
 
-    caminho = os.path.join(BASE_DIR, cnpj, codvendedor, nome)
-
-    if not os.path.exists(caminho):
-        # Arquivo sumiu do disco (ex.: redeploy/restart no Render, que tem
-        # filesystem efêmero) mas o registro no banco (Neon, persistente)
-        # ainda existe. Sem isso, /ultima continuaria reportando este mesmo
-        # arquivo morto por até EXPIRACAO_HORAS, prendendo o cliente num
-        # loop de 404. Apaga o registro órfão na hora, mesmo padrão do
-        # ramo de carga expirada logo abaixo.
-        db = Session()
-        try:
-            db.execute(
-                text(
-                    "DELETE FROM cargas "
-                    "WHERE cnpj = :cnpj AND codvendedor = :codvendedor AND nome_arquivo = :nome"
-                ),
-                {"cnpj": cnpj, "codvendedor": codvendedor, "nome": nome}
-            )
-            db.commit()
-        finally:
-            db.close()
-        raise HTTPException(status_code=404, detail="Arquivo não encontrado")
-
-    # Verifica validade e remove o registro do banco antes de servir o arquivo
     db = Session()
     try:
-        row = db.execute(
-            text(
-                "SELECT data_envio FROM cargas "
-                "WHERE cnpj = :cnpj AND codvendedor = :codvendedor AND nome_arquivo = :nome"
-            ),
-            {"cnpj": cnpj, "codvendedor": codvendedor, "nome": nome}
-        ).fetchone()
+        conteudo = _ler_arquivo(db, 'carga', cnpj, codvendedor, nome)
 
-        if not row or row[0] < _limite_validade():
+        if conteudo is None:
+            # Expirada ou inexistente: apaga a referência na hora para que
+            # /ultima não continue apontando para um arquivo indisponível.
             db.execute(
                 text(
                     "DELETE FROM cargas "
@@ -566,27 +586,14 @@ def download(cnpj: str, codvendedor: str, nome: str, authorization: str = Header
                 {"cnpj": cnpj, "codvendedor": codvendedor, "nome": nome}
             )
             db.commit()
-            if os.path.isfile(caminho):
-                os.remove(caminho)
             raise HTTPException(status_code=404, detail="Carga expirada ou não encontrada")
-
-        db.execute(
-            text(
-                "DELETE FROM cargas "
-                "WHERE cnpj = :cnpj AND codvendedor = :codvendedor AND nome_arquivo = :nome"
-            ),
-            {"cnpj": cnpj, "codvendedor": codvendedor, "nome": nome}
-        )
-        db.commit()
     finally:
         db.close()
 
-    # Serve o arquivo local
-    # Alternativa: com open() para controle total do stream
-    # with open(caminho, "rb") as f:
-    #     conteudo = f.read()
-    # return Response(content=conteudo, media_type="application/octet-stream")
-    return FileResponse(caminho)
+    # O registro não é apagado aqui: se a transferência cair no meio, o app
+    # consegue baixar de novo dentro da validade. A carga é consumida pelo
+    # DELETE abaixo, que o app chama depois de salvar o arquivo.
+    return _resposta_arquivo(conteudo, nome)
 
 # ------------------------------
 # Deletar carga após download confirmado
@@ -595,19 +602,9 @@ def download(cnpj: str, codvendedor: str, nome: str, authorization: str = Header
 def deletar_carga(cnpj: str, codvendedor: str, nome: str, authorization: str = Header(...)):
     verificar_token(authorization)
 
-    caminho = os.path.abspath(os.path.join(BASE_DIR, cnpj, codvendedor, nome))
-    base_abs = os.path.abspath(BASE_DIR)
-
-    if not caminho.startswith(base_abs + os.sep):
-        raise HTTPException(status_code=400, detail="Nome de arquivo inválido.")
-
-    # remove arquivo físico (ignora se já não existir)
-    if os.path.isfile(caminho):
-        os.remove(caminho)
-
-    # remove registro do banco
     db = Session()
     try:
+        _remover_arquivo(db, 'carga', cnpj, codvendedor, nome)
         db.execute(
             text(
                 "DELETE FROM cargas "
@@ -631,7 +628,7 @@ def deletar_carga_por_id(carga_id: int, authorization: str = Header(...)):
     db = Session()
     try:
         row = db.execute(
-            text("SELECT cnpj, idcelular, nome_arquivo FROM cargas WHERE id = :id"),
+            text("SELECT cnpj, codvendedor, nome_arquivo FROM cargas WHERE id = :id"),
             {"id": carga_id}
         ).fetchone()
 
@@ -639,10 +636,7 @@ def deletar_carga_por_id(carga_id: int, authorization: str = Header(...)):
             raise HTTPException(status_code=404, detail="Carga não encontrada.")
 
         cnpj, codvendedor, nome = row[0], row[1], row[2]
-        caminho = os.path.join(BASE_DIR, cnpj, codvendedor, nome)
-
-        if os.path.isfile(caminho):
-            os.remove(caminho)
+        _remover_arquivo(db, 'carga', cnpj, codvendedor, nome)
 
         db.execute(text("DELETE FROM cargas WHERE id = :id"), {"id": carga_id})
         db.commit()
@@ -682,20 +676,13 @@ async def upload_contagem(
             }
         )
 
-    pasta = os.path.join("contagens", cnpj, idcelular)
-    os.makedirs(pasta, exist_ok=True)
-
-    caminho = os.path.join(pasta, file.filename)
-
-    with open(caminho, "wb") as f:
-        f.write(conteudo)
-
     url_arquivo = f"/download-contagem/{cnpj}/{idcelular}/{file.filename}"
 
     db = Session()
     try:
         data_envio = _agora_local()
 
+        _salvar_arquivo(db, 'contagem', cnpj, idcelular, file.filename, conteudo)
         db.execute(
             text("""
                 INSERT INTO contagens (cnpj, idcelular, nome_arquivo, url_arquivo, data_envio)
@@ -735,15 +722,18 @@ def ultima_contagem(
     db = Session()
     try:
         contagem = db.execute(
-            text("""
-                SELECT nome_arquivo, url_arquivo, data_envio
-                FROM contagens
-                WHERE cnpj = :cnpj AND idcelular = :idcelular
-                  AND data_envio >= :limite
-                ORDER BY data_envio DESC
+            text(f"""
+                SELECT c.nome_arquivo, c.url_arquivo, c.data_envio
+                FROM contagens c
+                JOIN arquivos_transferencia a
+                  ON a.tipo = 'contagem' AND a.cnpj = c.cnpj
+                 AND a.pasta = c.idcelular AND a.nome_arquivo = c.nome_arquivo
+                WHERE c.cnpj = :cnpj AND c.idcelular = :idcelular
+                  AND {_SQL_ARQUIVO_VALIDO}
+                ORDER BY a.criado_em DESC
                 LIMIT 1
             """),
-            {"cnpj": cnpj, "idcelular": idcelular, "limite": _limite_validade()}
+            {"cnpj": cnpj, "idcelular": idcelular, "horas": EXPIRACAO_HORAS}
         ).fetchone()
     finally:
         db.close()
@@ -764,42 +754,18 @@ def ultima_contagem(
 def download_contagem(cnpj: str, idcelular: str, nome: str, authorization: str = Header(...)):
     verificar_token(authorization)
 
-    caminho = os.path.join("contagens", cnpj, idcelular, nome)
-
-    if not os.path.exists(caminho):
-        raise HTTPException(status_code=404, detail="Arquivo não encontrado")
-
-    # Verifica validade antes de servir
+    # O registro em `contagens` não é apagado aqui: o Manager remove o seu
+    # após confirmar o 404, e a limpeza periódica cuida dos que sobrarem.
     db_chk = Session()
     try:
-        row = db_chk.execute(
-            text(
-                "SELECT data_envio FROM contagens "
-                "WHERE cnpj = :cnpj AND idcelular = :idcelular AND nome_arquivo = :nome"
-            ),
-            {"cnpj": cnpj, "idcelular": idcelular, "nome": nome}
-        ).fetchone()
-
-        if not row or row[0] < _limite_validade():
-            if row:
-                db_chk.execute(
-                    text(
-                        "DELETE FROM contagens "
-                        "WHERE cnpj = :cnpj AND idcelular = :idcelular AND nome_arquivo = :nome"
-                    ),
-                    {"cnpj": cnpj, "idcelular": idcelular, "nome": nome}
-                )
-                db_chk.commit()
-            if os.path.isfile(caminho):
-                os.remove(caminho)
-            raise HTTPException(status_code=404, detail="Contagem expirada ou não encontrada")
+        conteudo = _ler_arquivo(db_chk, 'contagem', cnpj, idcelular, nome)
     finally:
         db_chk.close()
 
-    # Re-validar assinatura .sig antes de servir o arquivo
-    with open(caminho, "rb") as f:
-        conteudo = f.read()
+    if conteudo is None:
+        raise HTTPException(status_code=404, detail="Contagem expirada ou não encontrada")
 
+    # Re-validar assinatura .sig antes de servir o arquivo
     db_val = Session()
     try:
         token = _buscar_token_cliente(db_val, cnpj)
@@ -816,7 +782,7 @@ def download_contagem(cnpj: str, idcelular: str, nome: str, authorization: str =
             }
         )
 
-    return FileResponse(caminho)
+    return _resposta_arquivo(conteudo, nome)
 
 # ------------------------------
 # Deletar contagem após download confirmado
@@ -825,20 +791,17 @@ def download_contagem(cnpj: str, idcelular: str, nome: str, authorization: str =
 def deletar_contagem(cnpj: str, idcelular: str, nome: str, authorization: str = Header(...)):
     verificar_token(authorization)
 
-    contagens_abs = os.path.abspath("contagens")
-    caminho = os.path.abspath(os.path.join("contagens", cnpj, idcelular, nome))
+    db = Session()
+    try:
+        removido = _remover_arquivo(db, 'contagem', cnpj, idcelular, nome)
+        db.commit()
+    finally:
+        db.close()
 
-    if not caminho.startswith(contagens_abs + os.sep):
-        raise HTTPException(status_code=400, detail="Nome de arquivo inválido.")
-
-    if not os.path.isfile(caminho):
+    if not removido:
         raise HTTPException(status_code=404, detail=f"Arquivo '{nome}' não encontrado.")
 
-    try:
-        os.remove(caminho)
-        return JSONResponse(status_code=200, content={"ok": True, "mensagem": f"Arquivo '{nome}' removido com sucesso."})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao remover arquivo: {e}")
+    return JSONResponse(status_code=200, content={"ok": True, "mensagem": f"Arquivo '{nome}' removido com sucesso."})
 
 # ------------------------------
 # Listar contagens por CNPJ (usado pelo CSCollectManager como fallback HTTP)
@@ -850,14 +813,17 @@ def listar_contagens(cnpj: str, authorization: str = Header(...)):
     db = Session()
     try:
         rows = db.execute(
-            text("""
-                SELECT id, cnpj, idcelular, nome_arquivo, url_arquivo, data_envio
-                  FROM contagens
-                 WHERE cnpj = :cnpj
-                   AND data_envio >= :limite
-                 ORDER BY data_envio DESC
+            text(f"""
+                SELECT c.id, c.cnpj, c.idcelular, c.nome_arquivo, c.url_arquivo, c.data_envio
+                  FROM contagens c
+                  JOIN arquivos_transferencia a
+                    ON a.tipo = 'contagem' AND a.cnpj = c.cnpj
+                   AND a.pasta = c.idcelular AND a.nome_arquivo = c.nome_arquivo
+                 WHERE c.cnpj = :cnpj
+                   AND {_SQL_ARQUIVO_VALIDO}
+                 ORDER BY a.criado_em DESC
             """),
-            {"cnpj": cnpj, "limite": _limite_validade()}
+            {"cnpj": cnpj, "horas": EXPIRACAO_HORAS}
         ).fetchall()
     finally:
         db.close()
@@ -893,13 +859,7 @@ def deletar_contagem_por_id(contagem_id: int, authorization: str = Header(...)):
             raise HTTPException(status_code=404, detail="Contagem não encontrada.")
 
         cnpj, idcelular, nome = row[0], row[1], row[2]
-        caminho = os.path.join("contagens", cnpj, idcelular, nome)
-
-        if os.path.isfile(caminho):
-            try:
-                os.remove(caminho)
-            except Exception:
-                pass
+        _remover_arquivo(db, 'contagem', cnpj, idcelular, nome)
 
         db.execute(text("DELETE FROM contagens WHERE id = :id"), {"id": contagem_id})
         db.commit()
